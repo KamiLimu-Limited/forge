@@ -1,246 +1,221 @@
-"""User service with business logic."""
+"""User profile and administrative user management."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-from forge.models import AccountState, AuditLog, User, UserRoleAssignment
+from forge.core.config import settings
+from forge.core.exceptions import BadRequest, Conflict, NotFound
+from forge.core.security import generate_secure_token
+from forge.models import AccountState, Invitation, User, UserRoleAssignment
+from forge.schemas.auth import InvitationFilters
+from forge.schemas.user import (
+    AdminUserUpdateRequest,
+    RoleAssignmentRequest,
+    UserFilters,
+    UserProfileUpdateRequest,
+)
+from forge.services.audit import log_action
+from forge.services.pagination import paginate
 
 
-class UserNotFoundError(Exception):
-    """Raised when a user is not found."""
-
-    pass
-
-
-async def get_user_by_id(
-    db: AsyncSession,
-    user_id: uuid.UUID,
-    load_roles: bool = True,
-) -> User:
-    """Get a user by their ID.
-
-    Args:
-        db: Database session.
-        user_id: The user's UUID.
-        load_roles: Whether to eagerly load roles.
-
-    Returns:
-        The User object.
-
-    Raises:
-        UserNotFoundError: If user not found.
-    """
-    query = select(User).where(User.id == user_id)
-    if load_roles:
-        query = query.options(selectinload(User.roles))
-
-    user = await db.scalar(query)
-    if not user:
-        raise UserNotFoundError(f"User with id {user_id} not found")
-
+async def get_user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise NotFound("User not found")
     return user
 
 
-async def update_user_profile(
-    db: AsyncSession,
-    user: User,
-    first_name: str | None = None,
-    last_name: str | None = None,
+async def update_profile(
+    db: AsyncSession, user: User, data: UserProfileUpdateRequest
 ) -> User:
-    """Update a user's own profile.
-
-    Args:
-        db: Database session.
-        user: The user to update.
-        first_name: Optional new first name.
-        last_name: Optional new last name.
-
-    Returns:
-        The updated User object.
-    """
-    if first_name is not None:
-        user.first_name = first_name
-    if last_name is not None:
-        user.last_name = last_name
-
+    for key, value in data.model_dump(exclude_unset=True, exclude_none=True).items():
+        setattr(user, key, value)
     await db.commit()
     await db.refresh(user)
-
     return user
 
 
 async def admin_update_user(
-    db: AsyncSession,
-    user_id: uuid.UUID,
-    admin_user_id: uuid.UUID,
-    first_name: str | None = None,
-    last_name: str | None = None,
-    email: str | None = None,
+    db: AsyncSession, user: User, data: AdminUserUpdateRequest, admin: User
 ) -> User:
-    """Admin update of user details.
-
-    Args:
-        db: Database session.
-        user_id: ID of user to update.
-        admin_user_id: ID of admin making the change.
-        first_name: Optional new first name.
-        last_name: Optional new last name.
-        email: Optional new email.
-
-    Returns:
-        The updated User object.
-
-    Raises:
-        UserNotFoundError: If user not found.
-    """
-    user = await get_user_by_id(db, user_id)
-
-    changes = {}
-    if first_name is not None and first_name != user.first_name:
-        changes["first_name"] = {"old": user.first_name, "new": first_name}
-        user.first_name = first_name
-    if last_name is not None and last_name != user.last_name:
-        changes["last_name"] = {"old": user.last_name, "new": last_name}
-        user.last_name = last_name
-    if email is not None and email.lower() != user.email:
-        changes["email"] = {"old": user.email, "new": email.lower()}
-        user.email = email.lower()
+    changes: dict[str, dict[str, str]] = {}
+    for key, value in data.model_dump(exclude_unset=True, exclude_none=True).items():
+        if key == "email":
+            value = value.lower()
+            if value != user.email and await db.scalar(
+                select(User.id).where(User.email == value)
+            ):
+                raise Conflict("A user with this email already exists")
+        if getattr(user, key) != value:
+            changes[key] = {"old": getattr(user, key), "new": value}
+            setattr(user, key, value)
 
     if changes:
-        audit_log = AuditLog(
-            user_id=admin_user_id,
-            action="admin_update_user",
+        log_action(
+            db,
+            "admin_update_user",
+            user_id=admin.id,
             resource_type="user",
-            resource_id=user_id,
-            meta_data={"changes": changes},
+            resource_id=user.id,
+            changes=changes,
         )
-        db.add(audit_log)
-
     await db.commit()
     await db.refresh(user)
-
     return user
 
 
-async def suspend_user(
+async def set_account_state(
     db: AsyncSession,
-    user_id: uuid.UUID,
-    admin_user_id: uuid.UUID,
-    ip_address: str | None = None,
+    user: User,
+    state: AccountState,
+    admin: User,
+    ip_address: str | None,
 ) -> User:
-    """Suspend a user account.
-
-    Args:
-        db: Database session.
-        user_id: ID of user to suspend.
-        admin_user_id: ID of admin performing the action.
-        ip_address: Optional IP address for audit.
-
-    Returns:
-        The updated User object.
-
-    Raises:
-        UserNotFoundError: If user not found.
-    """
-    user = await get_user_by_id(db, user_id, load_roles=False)
+    if state is AccountState.SUSPENDED and user.id == admin.id:
+        raise BadRequest("Cannot suspend your own account")
+    if state is AccountState.ACTIVE and not user.password_hash:
+        raise BadRequest("User has not activated their account yet")
 
     old_state = user.account_state
-    user.account_state = AccountState.SUSPENDED
-
-    audit_log = AuditLog(
-        user_id=admin_user_id,
-        action="suspend_user",
+    user.account_state = state
+    action = "suspend_user" if state is AccountState.SUSPENDED else "reactivate_user"
+    log_action(
+        db,
+        action,
+        user_id=admin.id,
         resource_type="user",
-        resource_id=user_id,
-        meta_data={"old_state": old_state.value},
+        resource_id=user.id,
         ip_address=ip_address,
+        old_state=old_state.value,
     )
-    db.add(audit_log)
-
     await db.commit()
-    await db.refresh(user)
-
     return user
 
 
-async def activate_user(
-    db: AsyncSession,
-    user_id: uuid.UUID,
-    admin_user_id: uuid.UUID,
-    ip_address: str | None = None,
-) -> User:
-    """Reactivate a suspended user account.
+async def list_users(db: AsyncSession, filters: UserFilters) -> tuple[list[User], int]:
+    stmt = select(User).order_by(User.created_at.desc())
+    if filters.account_state:
+        stmt = stmt.where(User.account_state == filters.account_state)
+    if filters.role or filters.cohort_id:
+        role_stmt = select(UserRoleAssignment.user_id)
+        if filters.role:
+            role_stmt = role_stmt.where(UserRoleAssignment.role == filters.role)
+        if filters.cohort_id:
+            role_stmt = role_stmt.where(
+                UserRoleAssignment.cohort_id == filters.cohort_id
+            )
+        stmt = stmt.where(User.id.in_(role_stmt))
+    if filters.search:
+        pattern = f"%{filters.search}%"
+        stmt = stmt.where(
+            or_(
+                User.email.ilike(pattern),
+                User.first_name.ilike(pattern),
+                User.last_name.ilike(pattern),
+            )
+        )
+    return await paginate(db, stmt, filters)
 
-    Args:
-        db: Database session.
-        user_id: ID of user to activate.
-        admin_user_id: ID of admin performing the action.
-        ip_address: Optional IP address for audit.
 
-    Returns:
-        The updated User object.
-
-    Raises:
-        UserNotFoundError: If user not found.
-    """
-    user = await get_user_by_id(db, user_id, load_roles=False)
-
-    old_state = user.account_state
-    user.account_state = AccountState.ACTIVE
-
-    audit_log = AuditLog(
-        user_id=admin_user_id,
-        action="reactivate_user",
-        resource_type="user",
-        resource_id=user_id,
-        meta_data={"old_state": old_state.value},
-        ip_address=ip_address,
+async def assign_role(
+    db: AsyncSession, user: User, data: RoleAssignmentRequest, admin: User
+) -> UserRoleAssignment:
+    if any(r.role == data.role and r.cohort_id == data.cohort_id for r in user.roles):
+        raise Conflict("User already has this role")
+    assignment = UserRoleAssignment(
+        user_id=user.id, role=data.role, cohort_id=data.cohort_id, assigned_by=admin.id
     )
-    db.add(audit_log)
-
+    user.roles.append(assignment)
+    log_action(
+        db,
+        "assign_role",
+        user_id=admin.id,
+        resource_type="user",
+        resource_id=user.id,
+        role=data.role.value,
+        cohort_id=str(data.cohort_id) if data.cohort_id else None,
+    )
     await db.commit()
-    await db.refresh(user)
-
-    return user
+    return assignment
 
 
-async def list_users(
-    db: AsyncSession,
-    page: int = 1,
-    page_size: int = 20,
-    account_state: AccountState | None = None,
-) -> tuple[list[User], int]:
-    """List users with pagination.
+async def remove_role(
+    db: AsyncSession, user: User, assignment_id: uuid.UUID, admin: User
+) -> None:
+    assignment = next((r for r in user.roles if r.id == assignment_id), None)
+    if assignment is None:
+        raise NotFound("Role assignment not found")
+    if assignment.user_id == admin.id and assignment.role.value == "admin":
+        raise BadRequest("Cannot remove your own admin role")
+    user.roles.remove(assignment)
+    log_action(
+        db,
+        "remove_role",
+        user_id=admin.id,
+        resource_type="user",
+        resource_id=user.id,
+        role=assignment.role.value,
+    )
+    await db.commit()
 
-    Args:
-        db: Database session.
-        page: Page number (1-indexed).
-        page_size: Number of items per page.
-        account_state: Optional filter by account state.
 
-    Returns:
-        Tuple of (users, total_count).
-    """
-    query = select(User).options(selectinload(User.roles))
+async def list_invitations(
+    db: AsyncSession, filters: InvitationFilters
+) -> tuple[list[Invitation], int]:
+    stmt = select(Invitation).order_by(Invitation.created_at.desc())
+    if filters.pending_only:
+        stmt = stmt.where(
+            Invitation.used_at.is_(None),
+            Invitation.revoked_at.is_(None),
+            Invitation.expires_at > datetime.now(UTC),
+        )
+    return await paginate(db, stmt, filters)
 
-    if account_state:
-        query = query.where(User.account_state == account_state)
 
-    # Get total count
-    count_query = select(func.count()).select_from(User)
-    if account_state:
-        count_query = count_query.where(User.account_state == account_state)
-    total = await db.scalar(count_query) or 0
+async def get_pending_invitation(
+    db: AsyncSession, invitation_id: uuid.UUID
+) -> Invitation:
+    invitation = await db.get(Invitation, invitation_id)
+    if invitation is None:
+        raise NotFound("Invitation not found")
+    if not invitation.is_pending:
+        raise BadRequest("Invitation has already been used or revoked")
+    return invitation
 
-    # Get paginated results
-    offset = (page - 1) * page_size
-    query = query.order_by(User.created_at.desc()).offset(offset).limit(page_size)
 
-    result = await db.execute(query)
-    users = list(result.scalars().all())
+async def revoke_invitation(
+    db: AsyncSession, invitation_id: uuid.UUID, admin: User
+) -> None:
+    invitation = await get_pending_invitation(db, invitation_id)
+    invitation.revoked_at = datetime.now(UTC)
+    log_action(
+        db,
+        "revoke_invitation",
+        user_id=admin.id,
+        resource_type="invitation",
+        resource_id=invitation.id,
+    )
+    await db.commit()
 
-    return users, total
+
+async def renew_invitation(
+    db: AsyncSession, invitation_id: uuid.UUID, admin: User
+) -> Invitation:
+    """Rotate the token and extend expiry so the invitation can be re-sent."""
+    invitation = await get_pending_invitation(db, invitation_id)
+    invitation.token = generate_secure_token()
+    invitation.expires_at = datetime.now(UTC) + timedelta(
+        days=settings.INVITATION_TOKEN_EXPIRE_DAYS
+    )
+    log_action(
+        db,
+        "resend_invitation",
+        user_id=admin.id,
+        resource_type="invitation",
+        resource_id=invitation.id,
+    )
+    await db.commit()
+    return invitation

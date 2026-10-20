@@ -1,515 +1,412 @@
-"""Authentication service with business logic."""
+"""Authentication, invitation and password reset flows."""
 
+import csv
+import io
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from pydantic import ValidationError
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from forge.core.config import settings
+from forge.core.exceptions import (
+    BadRequest,
+    Conflict,
+    NotFound,
+    PermissionDenied,
+    Unauthorized,
+)
 from forge.core.jwt import (
     TokenError,
     TokenType,
     create_access_token,
     create_refresh_token,
-    get_token_expiration,
-    get_token_jti,
-    get_token_subject,
+    decode_token,
+    get_token_payload,
 )
 from forge.core.security import generate_secure_token, hash_password, verify_password
 from forge.models import (
     AccountState,
-    AuditLog,
+    Cohort,
     Invitation,
     PasswordResetToken,
     TokenBlacklist,
     User,
     UserRole,
-    UserRoleAssignment,
 )
+from forge.schemas.auth import (
+    BulkInviteResultEntry,
+    BulkInviteUserEntry,
+    InvitationPreview,
+    TokenResponse,
+    UserInviteRequest,
+)
+from forge.schemas.cohort import EnrollmentRequest
+from forge.services.audit import log_action
+from forge.services.cohorts import add_enrollment, ensure_role_assignment
 
 
-class AuthenticationError(Exception):
-    """Base exception for authentication errors."""
-
-    pass
-
-
-class InvalidCredentialsError(AuthenticationError):
-    """Raised when credentials are invalid."""
-
-    pass
+def issue_tokens(user_id: uuid.UUID) -> TokenResponse:
+    access_token, _, _ = create_access_token(user_id)
+    refresh_token, _, _ = create_refresh_token(user_id)
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-class AccountSuspendedError(AuthenticationError):
-    """Raised when account is suspended."""
-
-    pass
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
-class AccountNotActiveError(AuthenticationError):
-    """Raised when account is not active."""
-
-    pass
-
-
-class InvitationError(Exception):
-    """Base exception for invitation errors."""
-
-    pass
-
-
-class InvitationExpiredError(InvitationError):
-    """Raised when invitation has expired."""
-
-    pass
+async def _ensure_invitable(db: AsyncSession, email: str) -> None:
+    if await db.scalar(select(User.id).where(User.email == email)):
+        raise Conflict("A user with this email already exists")
+    pending = await db.scalar(
+        select(Invitation.id).where(
+            Invitation.email == email,
+            Invitation.used_at.is_(None),
+            Invitation.revoked_at.is_(None),
+            Invitation.expires_at > _now(),
+        )
+    )
+    if pending:
+        raise Conflict("A pending invitation already exists for this email")
 
 
-class InvitationAlreadyUsedError(InvitationError):
-    """Raised when invitation was already used."""
+async def _stage_invitation(
+    db: AsyncSession,
+    entry: UserInviteRequest | BulkInviteUserEntry,
+    cohort_id: uuid.UUID | None,
+    invited_by: uuid.UUID,
+) -> Invitation:
+    email = entry.email.lower()
+    await _ensure_invitable(db, email)
+    invitation = Invitation(
+        email=email,
+        token=generate_secure_token(),
+        expires_at=_now() + timedelta(days=settings.INVITATION_TOKEN_EXPIRE_DAYS),
+        invited_by=invited_by,
+        first_name=entry.first_name,
+        last_name=entry.last_name,
+        intended_roles=[r.value for r in entry.roles],
+        intended_cohort_id=cohort_id,
+    )
+    db.add(invitation)
+    await db.flush()
+    log_action(
+        db,
+        "invite_user",
+        user_id=invited_by,
+        resource_type="invitation",
+        resource_id=invitation.id,
+        email=email,
+    )
+    return invitation
 
-    pass
 
-
-class InvitationNotFoundError(InvitationError):
-    """Raised when invitation is not found."""
-
-    pass
-
-
-class TokenServiceError(Exception):
-    """Base exception for token service errors."""
-
-    pass
+async def _ensure_cohort(db: AsyncSession, cohort_id: uuid.UUID | None) -> None:
+    if cohort_id is not None:
+        cohort = await db.get(Cohort, cohort_id)
+        if cohort is None or cohort.deleted_at is not None:
+            raise NotFound("Cohort not found")
 
 
 async def create_invitation(
-    db: AsyncSession,
-    email: str,
-    invited_by_id: uuid.UUID,
-    first_name: str | None = None,
-    last_name: str | None = None,
-    intended_roles: list[UserRole] | None = None,
-    intended_cohort_id: uuid.UUID | None = None,
+    db: AsyncSession, data: UserInviteRequest, invited_by: User
 ) -> Invitation:
-    """Create a new user invitation.
-
-    Args:
-        db: Database session.
-        email: Email address to invite.
-        invited_by_id: UUID of the user sending the invitation.
-        first_name: Optional first name for the invited user.
-        last_name: Optional last name for the invited user.
-        intended_roles: Optional list of roles to assign on activation.
-        intended_cohort_id: Optional cohort ID for role assignment.
-
-    Returns:
-        The created Invitation object.
-    """
-    token = generate_secure_token()
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        days=settings.INVITATION_TOKEN_EXPIRE_DAYS
-    )
-
-    invitation = Invitation(
-        email=email.lower(),
-        token=token,
-        expires_at=expires_at,
-        invited_by=invited_by_id,
-        first_name=first_name,
-        last_name=last_name,
-        intended_roles=[r.value for r in intended_roles] if intended_roles else None,
-        intended_cohort_id=intended_cohort_id,
-    )
-
-    db.add(invitation)
+    await _ensure_cohort(db, data.cohort_id)
+    invitation = await _stage_invitation(db, data, data.cohort_id, invited_by.id)
     await db.commit()
-    await db.refresh(invitation)
-
     return invitation
 
 
-async def get_invitation_by_token(
+async def bulk_create_invitations(
     db: AsyncSession,
-    token: str,
-) -> Invitation:
-    """Get an invitation by its token.
+    entries: list[BulkInviteUserEntry],
+    cohort_id: uuid.UUID | None,
+    invited_by: User,
+) -> tuple[list[BulkInviteResultEntry], list[Invitation]]:
+    await _ensure_cohort(db, cohort_id)
+    results: list[BulkInviteResultEntry] = []
+    invitations: list[Invitation] = []
+    for entry in entries:
+        try:
+            async with db.begin_nested():
+                invitation = await _stage_invitation(
+                    db, entry, cohort_id, invited_by.id
+                )
+        except Conflict as e:
+            results.append(
+                BulkInviteResultEntry(
+                    email=entry.email, success=False, message=e.detail
+                )
+            )
+        else:
+            invitations.append(invitation)
+            results.append(
+                BulkInviteResultEntry(
+                    email=entry.email, success=True, message="Invitation sent"
+                )
+            )
+    await db.commit()
+    return results, invitations
 
-    Args:
-        db: Database session.
-        token: The invitation token.
 
-    Returns:
-        The Invitation object.
+def parse_invite_csv(
+    content: bytes,
+) -> tuple[list[BulkInviteUserEntry], list[BulkInviteResultEntry]]:
+    """Parse ``email,first_name,last_name,roles`` rows; roles are ``;``-separated."""
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise BadRequest("CSV must be UTF-8 encoded") from e
 
-    Raises:
-        InvitationNotFoundError: If invitation not found.
-        InvitationExpiredError: If invitation has expired.
-        InvitationAlreadyUsedError: If invitation was already used.
-    """
-    invitation = await db.scalar(
-        select(Invitation).where(Invitation.token == token)
-    )
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"email", "first_name", "last_name", "roles"}
+    if not reader.fieldnames or not required <= {f.strip() for f in reader.fieldnames}:
+        raise BadRequest(f"CSV must have columns: {', '.join(sorted(required))}")
 
-    if not invitation:
-        raise InvitationNotFoundError("Invalid invitation token")
+    entries: list[BulkInviteUserEntry] = []
+    errors: list[BulkInviteResultEntry] = []
+    for line, row in enumerate(reader, start=2):
+        row = {k.strip(): (v or "").strip() for k, v in row.items() if k}
+        try:
+            entries.append(
+                BulkInviteUserEntry(
+                    email=row["email"],
+                    first_name=row["first_name"],
+                    last_name=row["last_name"],
+                    roles=[r.strip() for r in row["roles"].split(";") if r.strip()],
+                )
+            )
+        except ValidationError as e:
+            reason = "; ".join(
+                f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors()
+            )
+            errors.append(
+                BulkInviteResultEntry(
+                    email=row.get("email", ""),
+                    success=False,
+                    message=f"Row {line}: {reason}",
+                )
+            )
+    if not entries and not errors:
+        raise BadRequest("CSV contains no rows")
+    return entries, errors
 
+
+async def get_valid_invitation(db: AsyncSession, token: str) -> Invitation:
+    invitation = await db.scalar(select(Invitation).where(Invitation.token == token))
+    if invitation is None or invitation.revoked_at is not None:
+        raise BadRequest("Invalid invitation token")
     if invitation.used_at is not None:
-        raise InvitationAlreadyUsedError("Invitation has already been used")
-
-    if invitation.expires_at < datetime.now(timezone.utc):
-        raise InvitationExpiredError("Invitation has expired")
-
+        raise BadRequest("Invitation has already been used")
+    if invitation.expires_at < _now():
+        raise BadRequest("Invitation has expired")
     return invitation
+
+
+async def preview_invitation(db: AsyncSession, token: str) -> InvitationPreview:
+    return InvitationPreview.model_validate(await get_valid_invitation(db, token))
 
 
 async def activate_account(
-    db: AsyncSession,
-    token: str,
-    password: str,
-) -> tuple[User, str, str]:
-    """Activate a user account from an invitation.
+    db: AsyncSession, token: str, password: str
+) -> tuple[User, TokenResponse]:
+    invitation = await get_valid_invitation(db, token)
+    user = await db.scalar(select(User).where(User.email == invitation.email))
 
-    Args:
-        db: Database session.
-        token: The invitation token.
-        password: The password to set for the account.
-
-    Returns:
-        Tuple of (User, access_token, refresh_token).
-
-    Raises:
-        InvitationError subclass: If invitation is invalid.
-    """
-    invitation = await get_invitation_by_token(db, token)
-
-    # Check if user already exists (shouldn't happen, but handle it)
-    existing_user = await db.scalar(
-        select(User).where(User.email == invitation.email.lower())
-    )
-
-    if existing_user:
-        # If user exists and is pending, activate them
-        if existing_user.account_state == AccountState.PENDING:
-            existing_user.password_hash = hash_password(password)
-            existing_user.account_state = AccountState.ACTIVE
-            existing_user.last_login_at = datetime.now(timezone.utc)
-            user = existing_user
-        else:
-            raise InvitationAlreadyUsedError(
-                "An account with this email already exists"
-            )
-    else:
-        # Create new user
+    if user is not None and user.account_state is not AccountState.PENDING:
+        raise BadRequest("An account with this email already exists")
+    if user is None:
         user = User(
-            email=invitation.email.lower(),
-            password_hash=hash_password(password),
+            email=invitation.email,
             first_name=invitation.first_name or "",
             last_name=invitation.last_name or "",
-            account_state=AccountState.ACTIVE,
-            last_login_at=datetime.now(timezone.utc),
         )
         db.add(user)
 
-    # Mark invitation as used
-    invitation.used_at = datetime.now(timezone.utc)
-
+    user.password_hash = hash_password(password)
+    user.account_state = AccountState.ACTIVE
+    user.last_login_at = _now()
+    invitation.used_at = _now()
     await db.flush()
 
-    # Assign intended roles if specified
-    if invitation.intended_roles:
-        for role_value in invitation.intended_roles:
-            role = UserRole(role_value)
-            role_assignment = UserRoleAssignment(
-                user_id=user.id,
-                role=role,
-                cohort_id=invitation.intended_cohort_id,
-                assigned_by=invitation.invited_by,
+    cohort = (
+        await db.get(Cohort, invitation.intended_cohort_id)
+        if invitation.intended_cohort_id
+        else None
+    )
+    for role_value in invitation.intended_roles or []:
+        role = UserRole(role_value)
+        if cohort is not None and role is not UserRole.ADMIN:
+            await add_enrollment(
+                db,
+                cohort,
+                EnrollmentRequest(user_id=user.id, role=role),
+                invitation.invited_by,
             )
-            db.add(role_assignment)
+        else:
+            await ensure_role_assignment(db, user.id, role, None, invitation.invited_by)
 
-    # Create audit log
-    audit_log = AuditLog(
+    log_action(
+        db,
+        "account_activated",
         user_id=user.id,
-        action="account_activated",
         resource_type="user",
         resource_id=user.id,
-        meta_data={"invitation_id": str(invitation.id)},
+        invitation_id=str(invitation.id),
     )
-    db.add(audit_log)
-
     await db.commit()
     await db.refresh(user)
-
-    # Generate tokens
-    access_token, _, _ = create_access_token(user.id)
-    refresh_token, _, _ = create_refresh_token(user.id)
-
-    return user, access_token, refresh_token
+    return user, issue_tokens(user.id)
 
 
 async def authenticate_user(
-    db: AsyncSession,
-    email: str,
-    password: str,
-    ip_address: str | None = None,
-) -> tuple[User, str, str]:
-    """Authenticate a user with email and password.
-
-    Args:
-        db: Database session.
-        email: User's email address.
-        password: User's password.
-        ip_address: Optional IP address for audit logging.
-
-    Returns:
-        Tuple of (User, access_token, refresh_token).
-
-    Raises:
-        InvalidCredentialsError: If credentials are invalid.
-        AccountSuspendedError: If account is suspended.
-        AccountNotActiveError: If account is not active.
-    """
-    user = await db.scalar(
-        select(User)
-        .options(selectinload(User.roles))
-        .where(User.email == email.lower())
-    )
-
-    if not user or not user.password_hash:
-        raise InvalidCredentialsError("Invalid email or password")
-
-    if not verify_password(password, user.password_hash):
-        raise InvalidCredentialsError("Invalid email or password")
-
-    if user.account_state == AccountState.SUSPENDED:
-        raise AccountSuspendedError(
+    db: AsyncSession, email: str, password: str, ip_address: str | None = None
+) -> tuple[User, TokenResponse]:
+    user = await db.scalar(select(User).where(User.email == email.lower()))
+    if (
+        user is None
+        or not user.password_hash
+        or not verify_password(password, user.password_hash)
+    ):
+        raise Unauthorized("Invalid email or password")
+    if user.account_state is AccountState.SUSPENDED:
+        raise PermissionDenied(
             "Account is suspended. Please contact the administrator."
         )
-
-    if user.account_state == AccountState.PENDING:
-        raise AccountNotActiveError(
+    if user.account_state is AccountState.PENDING:
+        raise PermissionDenied(
             "Account is not activated. Please check your email for activation link."
         )
 
-    # Update last login
-    user.last_login_at = datetime.now(timezone.utc)
-
-    # Create audit log
-    audit_log = AuditLog(
+    user.last_login_at = _now()
+    log_action(
+        db,
+        "login",
         user_id=user.id,
-        action="login",
         resource_type="user",
         resource_id=user.id,
         ip_address=ip_address,
     )
-    db.add(audit_log)
-
     await db.commit()
-    await db.refresh(user)
-
-    # Generate tokens
-    access_token, _, _ = create_access_token(user.id)
-    refresh_token, _, _ = create_refresh_token(user.id)
-
-    return user, access_token, refresh_token
+    return user, issue_tokens(user.id)
 
 
-async def refresh_tokens(
-    db: AsyncSession,
-    refresh_token: str,
-) -> tuple[str, str]:
-    """Refresh access and refresh tokens.
-
-    Args:
-        db: Database session.
-        refresh_token: The refresh token.
-
-    Returns:
-        Tuple of (new_access_token, new_refresh_token).
-
-    Raises:
-        TokenServiceError: If token is invalid or blacklisted.
-    """
-    try:
-        user_id_str = get_token_subject(refresh_token, TokenType.REFRESH)
-        jti = get_token_jti(refresh_token)
-    except TokenError as e:
-        raise TokenServiceError(str(e)) from e
-
-    # Check if refresh token is blacklisted
-    blacklisted = await db.scalar(
-        select(TokenBlacklist).where(TokenBlacklist.token_jti == jti)
-    )
-    if blacklisted:
-        raise TokenServiceError("Token has been revoked")
-
-    # Verify user exists and is active
-    user_id = uuid.UUID(user_id_str)
-    user = await db.scalar(select(User).where(User.id == user_id))
-
-    if not user:
-        raise TokenServiceError("User not found")
-
-    if user.account_state == AccountState.SUSPENDED:
-        raise TokenServiceError("Account is suspended")
-
-    # Blacklist old refresh token (rotate tokens)
-    try:
-        exp = get_token_expiration(refresh_token)
-        blacklist_entry = TokenBlacklist(
-            token_jti=jti,
-            expires_at=exp,
+async def _is_revoked(db: AsyncSession, jti: str) -> bool:
+    return (
+        await db.scalar(
+            select(TokenBlacklist.id).where(TokenBlacklist.token_jti == jti)
         )
-        db.add(blacklist_entry)
-        await db.commit()
-    except TokenError:
-        pass  # Token might be expired, which is fine
+        is not None
+    )
 
-    # Generate new tokens
-    new_access_token, _, _ = create_access_token(user.id)
-    new_refresh_token, _, _ = create_refresh_token(user.id)
 
-    return new_access_token, new_refresh_token
+def _blacklist(db: AsyncSession, payload: dict[str, object]) -> None:
+    db.add(
+        TokenBlacklist(
+            token_jti=str(payload["jti"]),
+            expires_at=datetime.fromtimestamp(float(str(payload["exp"])), tz=UTC),
+        )
+    )
+
+
+async def refresh_tokens(db: AsyncSession, refresh_token: str) -> TokenResponse:
+    """Exchange a refresh token for a new pair, revoking the old refresh token."""
+    try:
+        payload = get_token_payload(refresh_token, TokenType.REFRESH)
+    except TokenError as e:
+        raise Unauthorized(str(e)) from e
+
+    if await _is_revoked(db, payload["jti"]):
+        raise Unauthorized("Token has been revoked")
+
+    user = await db.get(User, uuid.UUID(payload["sub"]))
+    if user is None:
+        raise Unauthorized("User not found")
+    if user.account_state is not AccountState.ACTIVE:
+        raise Unauthorized("Account is not active")
+
+    _blacklist(db, payload)
+    await db.commit()
+    return issue_tokens(user.id)
 
 
 async def logout_user(
     db: AsyncSession,
+    user: User,
     access_token: str,
     refresh_token: str | None = None,
-    user_id: uuid.UUID | None = None,
     ip_address: str | None = None,
 ) -> None:
-    """Logout a user by blacklisting their tokens.
-
-    Args:
-        db: Database session.
-        access_token: The access token to blacklist.
-        refresh_token: Optional refresh token to blacklist.
-        user_id: Optional user ID for audit logging.
-        ip_address: Optional IP address for audit logging.
-    """
-    try:
-        access_jti = get_token_jti(access_token)
-        access_exp = get_token_expiration(access_token)
-        db.add(TokenBlacklist(token_jti=access_jti, expires_at=access_exp))
-    except TokenError:
-        pass  # Token might be invalid/expired
-
+    _blacklist(db, decode_token(access_token))
     if refresh_token:
         try:
-            refresh_jti = get_token_jti(refresh_token)
-            refresh_exp = get_token_expiration(refresh_token)
-            db.add(TokenBlacklist(token_jti=refresh_jti, expires_at=refresh_exp))
+            payload = decode_token(refresh_token)
         except TokenError:
-            pass
+            pass  # An expired or malformed refresh token is already unusable.
+        else:
+            if payload["sub"] == str(user.id) and not await _is_revoked(
+                db, payload["jti"]
+            ):
+                _blacklist(db, payload)
 
-    if user_id:
-        audit_log = AuditLog(
-            user_id=user_id,
-            action="logout",
-            resource_type="user",
-            resource_id=user_id,
-            ip_address=ip_address,
-        )
-        db.add(audit_log)
-
+    log_action(
+        db,
+        "logout",
+        user_id=user.id,
+        resource_type="user",
+        resource_id=user.id,
+        ip_address=ip_address,
+    )
     await db.commit()
 
 
 async def create_password_reset_token(
-    db: AsyncSession,
-    email: str,
-) -> PasswordResetToken | None:
-    """Create a password reset token for a user.
-
-    Args:
-        db: Database session.
-        email: User's email address.
-
-    Returns:
-        PasswordResetToken if user exists, None otherwise.
-        (We return None to prevent email enumeration)
-    """
+    db: AsyncSession, email: str
+) -> tuple[User, PasswordResetToken] | None:
+    """Create a reset token; ``None`` for unknown or suspended accounts (no enumeration)."""
     user = await db.scalar(select(User).where(User.email == email.lower()))
-
-    if not user:
+    if user is None or user.account_state is AccountState.SUSPENDED:
         return None
-
-    if user.account_state == AccountState.SUSPENDED:
-        return None
-
-    token = generate_secure_token()
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS
-    )
 
     reset_token = PasswordResetToken(
         user_id=user.id,
-        token=token,
-        expires_at=expires_at,
+        token=generate_secure_token(),
+        expires_at=_now() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS),
     )
-
     db.add(reset_token)
     await db.commit()
-    await db.refresh(reset_token)
-
-    return reset_token
+    return user, reset_token
 
 
-async def reset_password(
-    db: AsyncSession,
-    token: str,
-    new_password: str,
-) -> User:
-    """Reset a user's password using a reset token.
-
-    Args:
-        db: Database session.
-        token: The password reset token.
-        new_password: The new password.
-
-    Returns:
-        The updated User object.
-
-    Raises:
-        TokenServiceError: If token is invalid, expired, or already used.
-    """
+async def reset_password(db: AsyncSession, token: str, new_password: str) -> User:
     reset_token = await db.scalar(
         select(PasswordResetToken).where(PasswordResetToken.token == token)
     )
-
-    if not reset_token:
-        raise TokenServiceError("Invalid reset token")
-
+    if reset_token is None:
+        raise BadRequest("Invalid reset token")
     if reset_token.used_at is not None:
-        raise TokenServiceError("Reset token has already been used")
+        raise BadRequest("Reset token has already been used")
+    if reset_token.expires_at < _now():
+        raise BadRequest("Reset token has expired")
 
-    if reset_token.expires_at < datetime.now(timezone.utc):
-        raise TokenServiceError("Reset token has expired")
+    user = await db.get(User, reset_token.user_id)
+    if user is None:
+        raise BadRequest("Invalid reset token")
 
-    user = await db.scalar(
-        select(User).where(User.id == reset_token.user_id)
-    )
-
-    if not user:
-        raise TokenServiceError("User not found")
-
-    # Update password
     user.password_hash = hash_password(new_password)
-    reset_token.used_at = datetime.now(timezone.utc)
-
-    # Create audit log
-    audit_log = AuditLog(
-        user_id=user.id,
-        action="password_reset",
-        resource_type="user",
-        resource_id=user.id,
+    reset_token.used_at = _now()
+    log_action(
+        db, "password_reset", user_id=user.id, resource_type="user", resource_id=user.id
     )
-    db.add(audit_log)
-
     await db.commit()
-    await db.refresh(user)
-
     return user
+
+
+async def purge_expired_tokens(db: AsyncSession) -> int:
+    result = await db.execute(
+        delete(TokenBlacklist).where(TokenBlacklist.expires_at < _now())
+    )
+    await db.commit()
+    return int(getattr(result, "rowcount", 0) or 0)

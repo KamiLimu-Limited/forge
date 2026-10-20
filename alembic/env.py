@@ -3,22 +3,14 @@
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+import forge.models  # noqa: F401  registers all models on Base.metadata
+from alembic import context
 from forge.core.config import settings
 from forge.db.base import Base
-from forge.models import (  # noqa: F401 - Import to register models
-    AuditLog,
-    Cohort,
-    Invitation,
-    PasswordResetToken,
-    TokenBlacklist,
-    User,
-    UserRoleAssignment,
-)
 
 config = context.config
 
@@ -29,8 +21,8 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    """Get database URL from settings."""
-    return settings.DATABASE_URL
+    # Lets tests (and callers) point migrations at another database.
+    return config.get_main_option("sqlalchemy.url") or settings.DATABASE_URL
 
 
 def run_migrations_offline() -> None:
@@ -49,7 +41,9 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     """Run migrations with the given connection."""
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection, target_metadata=target_metadata, compare_type=True
+    )
 
     with context.begin_transaction():
         context.run_migrations()

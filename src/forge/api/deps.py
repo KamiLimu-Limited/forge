@@ -1,144 +1,100 @@
-"""FastAPI dependencies for authentication and authorization."""
+"""Shared FastAPI dependencies: database session, authentication and authorization."""
 
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from forge.core.exceptions import PermissionDenied, Unauthorized
 from forge.core.jwt import TokenError, TokenType, get_token_payload
+from forge.core.rate_limit import auth_rate_limiter, client_ip
 from forge.db.session import get_db
-from forge.models import AccountState, TokenBlacklist, User, UserRole, UserRoleAssignment
+from forge.models import AccountState, TokenBlacklist, User, UserRole
 
-security = HTTPBearer(auto_error=False)
+bearer_scheme = HTTPBearer(
+    auto_error=False, description="JWT access token from `/auth/login`"
+)
+
+DbSession = Annotated[AsyncSession, Depends(get_db)]
+BearerToken = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
 
 
-async def get_current_user(
-    request: Request,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> User:
-    """Get the current authenticated user from the JWT token.
+def get_client_ip(request: Request) -> str | None:
+    return client_ip(request)
 
-    Raises:
-        HTTPException: If token is invalid, blacklisted, or user not found.
-    """
-    if not credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
+ClientIP = Annotated[str | None, Depends(get_client_ip)]
+RateLimited = Depends(auth_rate_limiter)
+
+
+async def get_access_token(credentials: BearerToken) -> str:
+    if credentials is None:
+        raise Unauthorized()
+    return credentials.credentials
+
+
+AccessToken = Annotated[str, Depends(get_access_token)]
+
+
+async def get_current_user(token: AccessToken, db: DbSession) -> User:
     try:
-        payload = get_token_payload(credentials.credentials, TokenType.ACCESS)
+        payload = get_token_payload(token, TokenType.ACCESS)
     except TokenError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from e
+        raise Unauthorized(str(e)) from e
 
-    # Check if token is blacklisted
-    jti = payload.get("jti")
-    if jti:
-        blacklisted = await db.scalar(
-            select(TokenBlacklist).where(TokenBlacklist.token_jti == jti)
-        )
-        if blacklisted:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has been revoked",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    # Get user
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = await db.scalar(
-        select(User)
-        .options(selectinload(User.roles))
-        .where(User.id == UUID(user_id))
+    revoked = await db.scalar(
+        select(exists().where(TokenBlacklist.token_jti == payload["jti"]))
     )
+    if revoked:
+        raise Unauthorized("Token has been revoked")
 
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
+    user = await db.get(User, UUID(payload["sub"]))
+    if user is None:
+        raise Unauthorized("User not found")
+    if user.account_state is AccountState.SUSPENDED:
+        raise PermissionDenied(
+            "Account is suspended. Please contact the administrator."
         )
-
-    if user.account_state == AccountState.SUSPENDED:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is suspended. Please contact the administrator.",
-        )
-
     return user
 
 
-async def get_current_active_user(
-    current_user: Annotated[User, Depends(get_current_user)],
-) -> User:
-    """Get current user, ensuring they are active."""
-    if current_user.account_state != AccountState.ACTIVE:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is not active",
-        )
-    return current_user
-
-
-def has_role(required_roles: list[UserRole]):
-    """Dependency factory to check if user has any of the required roles.
-
-    Args:
-        required_roles: List of roles that grant access.
-
-    Returns:
-        Dependency function that validates user has required role.
-    """
-    async def check_role(
-        current_user: Annotated[User, Depends(get_current_active_user)],
-    ) -> User:
-        user_roles = {role.role for role in current_user.roles}
-
-        # Admin always has access
-        if UserRole.ADMIN in user_roles:
-            return current_user
-
-        if not any(role in user_roles for role in required_roles):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions",
-            )
-        return current_user
-
-    return check_role
-
-
-def require_admin():
-    """Dependency to require admin role."""
-    return has_role([UserRole.ADMIN])
-
-
-def require_committee_or_admin():
-    """Dependency to require committee or admin role."""
-    return has_role([UserRole.COMMITTEE, UserRole.ADMIN])
-
-
-# Type aliases for cleaner dependency injection
 CurrentUser = Annotated[User, Depends(get_current_user)]
-ActiveUser = Annotated[User, Depends(get_current_active_user)]
-AdminUser = Annotated[User, Depends(has_role([UserRole.ADMIN]))]
-CommitteeUser = Annotated[User, Depends(has_role([UserRole.COMMITTEE, UserRole.ADMIN]))]
-DbSession = Annotated[AsyncSession, Depends(get_db)]
+
+
+async def get_active_user(user: CurrentUser) -> User:
+    if user.account_state is not AccountState.ACTIVE:
+        raise PermissionDenied("Account is not active")
+    return user
+
+
+ActiveUser = Annotated[User, Depends(get_active_user)]
+
+
+class RequireRoles:
+    """Allow users holding any of ``roles`` (in any cohort). Admins always pass."""
+
+    def __init__(self, *roles: UserRole) -> None:
+        self.roles = frozenset(roles)
+
+    async def __call__(self, user: ActiveUser) -> User:
+        if user.is_admin or self.roles & user.role_set:
+            return user
+        raise PermissionDenied()
+
+
+AdminUser = Annotated[User, Depends(RequireRoles(UserRole.ADMIN))]
+CommitteeUser = Annotated[User, Depends(RequireRoles(UserRole.COMMITTEE))]
+MenteeUser = Annotated[User, Depends(RequireRoles(UserRole.MENTEE))]
+PeerMentorUser = Annotated[
+    User, Depends(RequireRoles(UserRole.PEER_MENTOR_1_1, UserRole.PEER_MENTOR_ICT))
+]
+OneOnOnePeerMentorUser = Annotated[
+    User, Depends(RequireRoles(UserRole.PEER_MENTOR_1_1))
+]
+IctPeerMentorUser = Annotated[User, Depends(RequireRoles(UserRole.PEER_MENTOR_ICT))]
+ProfessionalMentorUser = Annotated[
+    User, Depends(RequireRoles(UserRole.PROFESSIONAL_MENTOR))
+]

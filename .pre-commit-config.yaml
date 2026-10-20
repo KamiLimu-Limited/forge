@@ -23,6 +23,7 @@ repos:
           - fastapi>=0.115.0
           - pydantic>=2.10.0
           - pydantic-settings>=2.6.0
-          - sqlalchemy>=2.0.0
-          - types-passlib
-          - types-python-jose
+          - sqlalchemy[asyncio]>=2.1.0
+          - pyjwt>=2.10.0
+          - pwdlib[argon2,bcrypt]>=0.2.1
+          - cryptography>=43.0.0

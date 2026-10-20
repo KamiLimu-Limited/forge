@@ -93,3 +93,5 @@ logs/
 
 # Agents
 .claude
+
+!.env.example

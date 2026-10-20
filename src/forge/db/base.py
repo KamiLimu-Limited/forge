@@ -1,14 +1,14 @@
-"""SQLAlchemy declarative base and common model utilities."""
+"""SQLAlchemy declarative base and common model mixins."""
 
+import enum
 import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, MetaData, func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
+from sqlalchemy import DateTime, Enum, MetaData, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# Naming convention for constraints to ensure consistent migration naming
 convention = {
     "ix": "ix_%(column_0_label)s",
     "uq": "uq_%(table_name)s_%(column_0_name)s",
@@ -19,48 +19,35 @@ convention = {
 
 
 class Base(DeclarativeBase):
-    """Base class for all SQLAlchemy models."""
-
     metadata = MetaData(naming_convention=convention)
-
-    @declared_attr.directive
-    def __tablename__(cls) -> str:
-        """Generate table name from class name."""
-        # Convert CamelCase to snake_case
-        name = cls.__name__
-        return "".join(
-            f"_{c.lower()}" if c.isupper() else c for c in name
-        ).lstrip("_")
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert model to dictionary."""
-        return {
-            column.name: getattr(self, column.name)
-            for column in self.__table__.columns
-        }
+    type_annotation_map = {
+        uuid.UUID: UUID(as_uuid=True),
+        datetime: DateTime(timezone=True),
+        dict[str, Any]: JSONB,
+        dict[str, int]: JSONB,
+        list[str]: JSONB,
+        list[dict[str, Any]]: JSONB,
+    }
 
 
-class TimestampMixin:
-    """Mixin that adds created_at and updated_at timestamps."""
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
+def pg_enum(enum_cls: type[enum.Enum], name: str | None = None) -> Enum:
+    """Native Postgres enum persisted by member *value*."""
+    return Enum(
+        enum_cls,
+        name=name or enum_cls.__name__.lower(),
+        values_callable=lambda members: [m.value for m in members],
     )
 
 
 class UUIDPrimaryKeyMixin:
-    """Mixin that adds a UUID primary key."""
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
+
+class CreatedAtMixin:
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class TimestampMixin(CreatedAtMixin):
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
     )

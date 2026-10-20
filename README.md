@@ -1,373 +1,232 @@
 # Forge - KamiLimu Learning System
 
-Forge is the backend API for the KamiLimu mentorship programme management system. It provides a comprehensive REST API for managing mentees, sessions, attendance, and programme operations.
+Forge is the backend REST API for the KamiLimu mentorship programme. It manages cohorts,
+sessions, attendance, points and graduation, extra activities, peer mentorship,
+leaderboards, notifications and analytics. It is API-only; a separate frontend consumes it.
 
-## Table of Contents
+## Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
-- [Installation](#installation)
+- [Quick start](#quick-start)
 - [Configuration](#configuration)
-- [Database Setup](#database-setup)
-- [Creating the System Administrator](#creating-the-system-administrator)
-- [Running the Application](#running-the-application)
-- [API Documentation](#api-documentation)
-- [User Management](#user-management)
+- [API documentation](#api-documentation)
+- [API conventions](#api-conventions)
+- [Programme rules](#programme-rules)
+- [Background jobs](#background-jobs)
 - [Development](#development)
 - [Testing](#testing)
+- [Deployment](#deployment)
 
 ## Features
 
-- **Invitation-based Registration**: Secure user onboarding through email invitations
-- **JWT Authentication**: Token-based authentication with access and refresh tokens
-- **Role-based Access Control**: Fine-grained permissions based on user roles
-- **Audit Logging**: Track all significant actions for accountability
-- **Email Notifications**: Automated emails for invitations and password resets
+| Area | What it covers |
+|------|----------------|
+| Authentication | Invitation-only onboarding (single, bulk JSON or CSV upload), activation, JWT access/refresh tokens with rotation and revocation, password reset, rate limiting |
+| Users & admin | Profiles, account suspension, global and cohort-scoped roles, invitation management, audit trail |
+| Cohorts | Cohorts with KamiLimu month boundaries, ICT tracks, skills and rating windows; enrollments with 1:1 peer mentor groups |
+| Sessions | Thursday, Saturday and peer mentorship sessions; publish, reschedule (with history), cancel; mentors and resources; calendars |
+| Attendance | Category-based attendance windows, submissions with feedback ratings, per-mentee override requests, automatic `missed` marking |
+| Points & graduation | Core and extra points, rates by month, track and type, graduation status (`on_track`, `warning`, `at_risk`), cohort report |
+| Extra activities | Academic, event, opportunity and consultation activities with typed details and committee validation |
+| Peer mentorship | Encrypted private notes, ICT progress notes, group tasks with submissions and reminders |
+| Skills | Early, mid and late-programme self-ratings and progress |
+| Leaderboard & competitions | Six-dimension leaderboard with an anonymity toggle and CSV export; competitions, rounds and entries |
+| Dashboards | Mentee, 1:1 peer mentor, ICT peer mentor, professional mentor and committee views |
+| Notifications | In-app notifications for every programme event, queued email delivery with retries, broadcasts |
+| Analytics & exports | Trends, track performance, session quality, health trajectory, engagement, cross-cohort comparison, daily snapshots, CSV exports |
 
 ## Requirements
 
 - Python 3.11+
-- PostgreSQL 14+ (or Supabase)
-- (Optional) Resend account for email delivery
+- PostgreSQL 14+ (Docker Compose provides one for development)
+- Optional: a [Resend](https://resend.com) API key for email delivery
 
-## Installation
+## Quick start
 
-1. **Clone the repository**
+```bash
+# 1. Install
+uv venv && uv pip install -e ".[dev]"      # or: python -m venv .venv && pip install -e ".[dev]"
 
-   ```bash
-   git clone <repository-url>
-   cd forge
-   ```
+# 2. Start Postgres (port 5433; creates `forge` and `forge_test` databases)
+docker compose up -d db
 
-2. **Create a virtual environment**
+# 3. Configure
+cp .env.example .env                        # defaults already point at the compose database
 
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+# 4. Migrate and create the first admin
+alembic upgrade head
+forge-cli create-admin --email admin@kamilimu.org --first-name Admin --last-name User
 
-3. **Install dependencies**
+# 5. Run
+uvicorn forge.main:app --reload
+```
 
-   ```bash
-   # Install production dependencies
-   pip install -e .
+Then open http://localhost:8000/api/v1/docs.
 
-   # Install development dependencies (for testing and linting)
-   pip install -e ".[dev]"
-   ```
+**On NixOS**, run `nix-shell` (or `nix-shell --command fish`) first. It provides Python, uv,
+ruff and the Postgres client, exposes the system libraries that prebuilt wheels such as
+greenlet need, and activates `.venv`, creating it on first use.
 
 ## Configuration
 
-1. **Copy the example environment file**
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. **Edit `.env` with your settings**
-
-   ```bash
-   # Required settings to configure:
-
-   # Database connection (PostgreSQL)
-   DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/forge
-
-   # IMPORTANT: Generate a secure secret key for production
-   # Use: openssl rand -hex 32
-   SECRET_KEY=your-secure-secret-key-here
-
-   # Frontend URL for email links
-   FRONTEND_URL=https://your-frontend-domain.com
-
-   # Email service (optional but recommended for production)
-   RESEND_API_KEY=re_your_api_key_here
-   EMAIL_FROM_ADDRESS=noreply@yourdomain.com
-   ```
-
-### Environment Variables Reference
+All settings are environment variables (or `.env`) read by `forge.core.config.Settings`.
+`.env.example` lists every one of them.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | Required |
-| `SECRET_KEY` | JWT signing key (use `openssl rand -hex 32`) | Required for production |
-| `FRONTEND_URL` | Base URL for email links | `http://localhost:3000` |
-| `CORS_ORIGINS` | Comma-separated list of allowed origins | `http://localhost:3000` |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | Access token lifetime | `60` |
-| `REFRESH_TOKEN_EXPIRE_DAYS` | Refresh token lifetime | `7` |
-| `INVITATION_TOKEN_EXPIRE_DAYS` | Invitation link validity | `7` |
-| `RESEND_API_KEY` | Resend API key for emails | Optional |
-| `EMAIL_FROM_ADDRESS` | Sender email address | `noreply@kamilimu.org` |
+| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:port/db` | compose database |
+| `SECRET_KEY` | JWT signing key (`openssl rand -hex 32`) | insecure dev value |
+| `DATA_ENCRYPTION_KEY` | Fernet key for private notes; derived from `SECRET_KEY` if empty | — |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | Token lifetimes | `60` / `7` |
+| `INVITATION_TOKEN_EXPIRE_DAYS` / `PASSWORD_RESET_TOKEN_EXPIRE_HOURS` | Link lifetimes | `7` / `24` |
+| `CORS_ORIGINS` | Comma-separated allowed origins | `http://localhost:3000` |
+| `FRONTEND_URL` | Base URL used in email links | `http://localhost:3000` |
+| `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME` | Email delivery; without a key emails are skipped and logged | — |
+| `SCHEDULER_ENABLED`, `SCHEDULER_INTERVAL_SECONDS` | Background jobs | `false`, `300` |
+| `RATE_LIMIT_ENABLED`, `RATE_LIMIT_AUTH_TIMES`, `RATE_LIMIT_AUTH_SECONDS` | Auth endpoint rate limit | `true`, `10` per `60`s |
+| `DEFAULT_GRADUATION_THRESHOLD`, `GRADUATION_WARNING_MARGIN` | Graduation rule | `80`, `5` |
+| `THURSDAY_WINDOW_HOURS`, `SATURDAY_WINDOW_HOURS`, `PEER_MENTORSHIP_WINDOW_HOURS` | Attendance windows after a session ends | `24`, `48`, `72` |
+| `OVERRIDE_EXTENSION_HOURS` | Default extension when an override is approved | `48` |
+| `DEFAULT_SESSION_POINTS`, `EXTRA_ACTIVITY_DEFAULT_POINTS` | Points defaults | `10`, `5` per type |
+| `DEFAULT_SKILL_NAMES` | Skills used when a cohort doesn't define its own | six programme skills |
 
-## Database Setup
+## API documentation
 
-1. **Create the database**
+Interactive docs are generated by FastAPI:
 
-   ```bash
-   # Using psql
-   createdb forge
+- Swagger UI: `/api/v1/docs` (use **Authorize** with an access token)
+- ReDoc: `/api/v1/redoc`
+- OpenAPI schema: `/api/v1/openapi.json`
 
-   # Or connect to PostgreSQL and run:
-   # CREATE DATABASE forge;
-   ```
+Every endpoint is described there with its request and response schemas, permissions and
+error responses. Endpoints are grouped by tag: Authentication, Users, Admin, Audit, Cohorts,
+Sessions, Attendance, Mentee Progress, Extra Activities, Peer Mentorship, Skills,
+Leaderboard & Competitions, Dashboards, Notifications, Analytics, Exports, Health.
 
-2. **Run database migrations**
+### Authentication flow
 
-   ```bash
-   alembic upgrade head
-   ```
+```text
+POST /api/v1/auth/invite            (admin)  -> email with activation link
+POST /api/v1/auth/activate          {token, password} -> {access_token, refresh_token}
+POST /api/v1/auth/login             {email, password} -> {access_token, refresh_token, expires_in}
+     Authorization: Bearer <access_token>   on every other request
+POST /api/v1/auth/refresh           {refresh_token} -> new pair; the old refresh token is revoked
+POST /api/v1/auth/logout            revokes the access token (and refresh token if sent)
+```
 
-   This creates all required tables:
-   - `users` - User accounts
-   - `user_roles` - Role assignments
-   - `invitations` - User invitations
-   - `token_blacklist` - Revoked JWT tokens
-   - `password_reset_tokens` - Password reset requests
-   - `audit_logs` - Action audit trail
-   - `cohorts` - Programme cohorts (Phase 2)
-
-## Creating the System Administrator
-
-The first admin user must be created using the CLI tool. This admin can then invite other users through the API.
-
-### Using the CLI
+Bulk onboarding a cohort from CSV:
 
 ```bash
-# Interactive mode (recommended - prompts for password)
-forge-cli create-admin \
-  --email admin@kamilimu.org \
-  --first-name Admin \
-  --last-name User
-
-# Non-interactive mode (for scripting)
-forge-cli create-admin \
-  --email admin@kamilimu.org \
-  --first-name Admin \
-  --last-name User \
-  --password "YourSecurePassword123"
+curl -X POST localhost:8000/api/v1/auth/bulk-invite/csv \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@cohort11.csv" -F "cohort_id=$COHORT_ID"
 ```
 
-**Password Requirements:**
-- Minimum 8 characters
-- At least one uppercase letter
-- At least one lowercase letter
-- At least one digit
+The CSV has the columns `email,first_name,last_name,roles`. Separate multiple roles with `;`.
 
-### Alternative: Direct Database Insert
+## API conventions
 
-For automated deployments, you can also create the admin via SQL:
+- **Errors** always share one shape: `{"success": false, "error": "<code>", "detail": ...}`.
+  The codes are `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
+  `business_rule_violation`, `validation_error` and `rate_limited`.
+- **Pagination**: list endpoints accept `page` (from 1) and `page_size` (≤ 100) and return
+  `{items, total, page, page_size, total_pages}`. Unknown query parameters are rejected.
+- **Rate limiting**: login, activation and reset requests are limited per client IP and return
+  `429` when exceeded. The limiter is in-memory per process; with several workers, also limit at
+  the reverse proxy.
+- **Access control** is enforced in the API layer (it replaces the plan's Postgres RLS
+  policies, since Forge uses its own JWTs and a single database role):
+  - users read and write their own records;
+  - 1:1 peer mentors read their group's;
+  - ICT peer mentors read mentees on their track;
+  - committee members manage their cohort;
+  - admins can do everything.
 
-```sql
--- Generate password hash using Python first:
--- python -c "from forge.core.security import hash_password; print(hash_password('YourPassword123'))"
+  Roles can be global or scoped to a cohort.
 
-INSERT INTO users (id, email, password_hash, first_name, last_name, account_state, created_at, updated_at)
-VALUES (
-  gen_random_uuid(),
-  'admin@kamilimu.org',
-  '$2b$12$...hashed_password_here...',
-  'Admin',
-  'User',
-  'active',
-  NOW(),
-  NOW()
-);
+## Programme rules
 
--- Get the user ID and assign admin role
-INSERT INTO user_roles (id, user_id, role, assigned_at)
-SELECT gen_random_uuid(), id, 'admin', NOW()
-FROM users WHERE email = 'admin@kamilimu.org';
-```
+These defaults stand in for the PRD and are all configurable.
 
-## Running the Application
+- **Attendance windows** open when a session starts. They close 24h (Thursday) or 48h
+  (Saturday) after it ends, or at the session's explicit deadline (peer mentorship; otherwise
+  the cohort or default allowance). An approved override extends the window for one mentee.
+- **Counting**: a session counts for a mentee once it has started and is published or
+  completed. It must also apply to the mentee: they enrolled before it started, and for an ICT
+  session they're on its track.
+  - `attended` earns the session's points.
+  - `not_attended`, `missed` and `disputed` earn nothing.
+  - `excused` sessions leave the denominator.
+  - Sessions still inside their window without a submission are *upcoming* and not yet counted.
+- **Combined rate** = (core points earned + approved extra-activity points) / core points
+  available, capped at 100%.
+- **Graduation status**:
+  - `on_track` at or above threshold + margin (85% by default);
+  - `warning` at or above the threshold (80%);
+  - otherwise `at_risk`.
 
-### Development
+  Once a cohort is `completed` the status becomes final: `graduated` or `not_graduated`.
 
-```bash
-# Start the development server with auto-reload
-uvicorn forge.main:app --reload --host 0.0.0.0 --port 8000
-```
+## Background jobs
 
-### Production
+With `SCHEDULER_ENABLED=true` the app runs these jobs every `SCHEDULER_INTERVAL_SECONDS`. A
+Postgres advisory lock makes sure only one worker runs them:
 
-```bash
-# Using uvicorn directly
-uvicorn forge.main:app --host 0.0.0.0 --port 8000 --workers 4
-
-# Or with gunicorn
-gunicorn forge.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
-```
-
-### Docker
-
-```dockerfile
-# Example Dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY . .
-RUN pip install -e .
-
-CMD ["uvicorn", "forge.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-## API Documentation
-
-Once the application is running, access the interactive API documentation:
-
-- **Swagger UI**: http://localhost:8000/api/v1/docs
-- **ReDoc**: http://localhost:8000/api/v1/redoc
-- **OpenAPI JSON**: http://localhost:8000/api/v1/openapi.json
-
-## User Management
-
-### How Users are Created
-
-Forge uses an **invitation-based system**. Users cannot self-register.
-
-1. **Admin invites a user** via `POST /api/v1/auth/invite`
-2. **User receives email** with an activation link
-3. **User activates account** by setting their password at `POST /api/v1/auth/activate`
-4. **User can now log in** via `POST /api/v1/auth/login`
-
-### Inviting Users (Admin Only)
-
-```bash
-# Single user invitation
-curl -X POST http://localhost:8000/api/v1/auth/invite \
-  -H "Authorization: Bearer <admin_token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "mentee@example.com",
-    "first_name": "John",
-    "last_name": "Doe",
-    "roles": ["mentee"],
-    "cohort_id": "optional-cohort-uuid"
-  }'
-
-# Bulk invitation (for onboarding a cohort)
-curl -X POST http://localhost:8000/api/v1/auth/bulk-invite \
-  -H "Authorization: Bearer <admin_token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "users": [
-      {"email": "user1@example.com", "first_name": "User", "last_name": "One", "roles": ["mentee"]},
-      {"email": "user2@example.com", "first_name": "User", "last_name": "Two", "roles": ["mentee"]}
-    ],
-    "cohort_id": "optional-cohort-uuid"
-  }'
-```
-
-### User Roles
-
-| Role | Description |
-|------|-------------|
-| `admin` | Full system access, can manage all users and settings |
-| `committee` | Programme management and oversight |
-| `mentee` | Programme participant |
-| `peer_mentor_1:1` | One-on-one peer mentor (KamiLimu alumni) |
-| `peer_mentor_ict` | ICT track peer mentor |
-| `professional_mentor` | Session facilitator |
-| `partner` | Programme partner/sponsor |
-| `alumni` | Graduated mentee |
-
-### Authentication Flow
-
-```
-1. Login
-   POST /api/v1/auth/login
-   Body: {"email": "user@example.com", "password": "password"}
-   Response: {"access_token": "...", "refresh_token": "...", "expires_in": 3600}
-
-2. Use access token in requests
-   Authorization: Bearer <access_token>
-
-3. When access token expires, refresh it
-   POST /api/v1/auth/refresh
-   Body: {"refresh_token": "..."}
-   Response: {"access_token": "...", "refresh_token": "...", "expires_in": 3600}
-
-4. Logout (invalidates tokens)
-   POST /api/v1/auth/logout
-   Authorization: Bearer <access_token>
-```
+1. close expired attendance windows and record `missed` attendance;
+2. send window-closing reminders to mentees who haven't submitted;
+3. announce launched peer-mentor tasks and send deadline reminders;
+4. send weekly graduation warnings to `warning` and `at_risk` mentees;
+5. deliver queued notification emails, retrying up to `NOTIFICATION_MAX_ATTEMPTS`;
+6. purge expired revoked tokens;
+7. take a daily analytics snapshot of each active cohort.
 
 ## Development
 
-### Project Structure
-
+```text
+src/forge/
+  main.py            app factory: lifespan, middleware, exception handlers, docs metadata
+  api/
+    deps.py          DB session, auth, role dependencies (RequireRoles, AdminUser, ...)
+    router.py        aggregates every router under /api/v1
+    routes/          one module per domain
+  core/              settings, JWT, password hashing, encryption, rate limiting, exceptions
+  db/                declarative base, session factory, EncryptedText column type
+  models/            SQLAlchemy models
+  schemas/           Pydantic request/response models
+  services/          business logic (points engine, windows, notifications, analytics, ...)
+  cli.py             forge-cli create-admin
+alembic/versions/    001 auth schema, 002 programme schema
+tests/               unit/ and integration/ (real Postgres)
 ```
-forge/
-   alembic/                 # Database migrations
-      versions/            # Migration files
-   src/forge/
-      api/
-         deps.py          # Dependency injection
-         routes/          # API endpoints
-      core/
-         config.py        # Settings
-         jwt.py           # Token utilities
-         security.py      # Password hashing
-      db/
-         base.py          # SQLAlchemy base
-         session.py       # Database session
-      models/              # SQLAlchemy models
-      schemas/             # Pydantic schemas
-      services/            # Business logic
-      cli.py               # CLI commands
-      main.py              # Application entry
-   tests/
-      unit/                # Unit tests
-      integration/         # Integration tests
-   .env.example             # Environment template
-   alembic.ini              # Alembic config
-   pyproject.toml           # Project config
-```
-
-### Code Quality
 
 ```bash
-# Run linter
-ruff check src tests
-
-# Run formatter
-ruff format src tests
-
-# Run type checker
+ruff check src tests && ruff format src tests
 mypy src
 ```
 
+Routes stay thin. Services raise domain exceptions (`forge.core.exceptions`), and one
+exception handler turns them into the error envelope. Responses are declared with
+`response_model` or return annotations and built directly from ORM objects.
+
 ## Testing
 
-```bash
-# Run all tests
-pytest
-
-# Run with coverage report
-pytest --cov=forge --cov-report=html
-
-# Run specific test file
-pytest tests/unit/test_security.py
-
-# Run specific test
-pytest tests/integration/test_auth_endpoints.py::TestLogin::test_login_success
-```
-
-### Test Database
-
-Tests use an in-memory SQLite database by default. For integration tests against PostgreSQL:
+Tests run against a real PostgreSQL database. Migrations are applied once per run, and each
+test runs inside a transaction that is rolled back afterwards.
 
 ```bash
-# Set test database URL
-export TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5432/forge_test
-
-# Run tests
-pytest
+docker compose up -d db                     # provides forge_test on port 5433
+pytest                                      # unit + integration, with coverage
+TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/forge_test pytest
 ```
+
+## Deployment
+
+The `Dockerfile` builds the API image. `docker-compose.prod.yaml` runs migrations on start
+(`alembic upgrade head`), then serves with uvicorn. Set at least `DATABASE_URL`,
+`SECRET_KEY`, `RESEND_API_KEY`, `FRONTEND_URL` and `CORS_ORIGINS`. `/health` is the liveness
+probe and `/health/ready` checks the database.
 
 ## License
 
-Proprietary - KamiLimu
-
-## Support
-
-For issues and questions, contact support@kamilimu.org
+Proprietary - KamiLimu. For support contact support@kamilimu.org.
