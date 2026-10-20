@@ -14,8 +14,16 @@ from forge.core.exceptions import TooManyRequests
 
 
 def client_ip(request: Request) -> str | None:
-    if forwarded := request.headers.get("X-Forwarded-For"):
-        return forwarded.split(",")[0].strip()
+    """Client address as seen by the outermost trusted proxy.
+
+    Each proxy appends the address it received from, so the leftmost entries are
+    whatever the client sent and can't be trusted.
+    """
+    hops = settings.TRUSTED_PROXY_HOPS
+    if hops > 0 and (forwarded := request.headers.get("X-Forwarded-For")):
+        hosts = [h.strip() for h in forwarded.split(",") if h.strip()]
+        if hosts:
+            return hosts[max(len(hosts) - hops, 0)]
     return request.client.host if request.client else None
 
 

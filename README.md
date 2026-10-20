@@ -227,6 +227,22 @@ The `Dockerfile` builds the API image. `docker-compose.prod.yaml` runs migration
 `SECRET_KEY`, `RESEND_API_KEY`, `FRONTEND_URL` and `CORS_ORIGINS`. `/health` is the liveness
 probe and `/health/ready` checks the database.
 
+### Render (dev)
+
+`render.yaml` is a Render Blueprint for the dev environment: a Docker web service
+(`forge-api-dev`, deploys on every push to `develop`) and a Postgres 16 database
+(`forge-db-dev`), both in Frankfurt. Migrations run as the pre-deploy command, and
+`DATABASE_URL` is wired from the database (plain `postgres://` URLs are converted to
+`postgresql+asyncpg://` automatically).
+
+1. In the Render dashboard choose **New → Blueprint** and select this repository.
+2. Fill in the values marked "sync: false": `RESEND_API_KEY`, `FRONTEND_URL`,
+   `CORS_ORIGINS` and `DATA_ENCRYPTION_KEY`. Generate the encryption key with
+   `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+   and keep it; private notes can't be decrypted without it.
+3. After the first deploy, open **Shell** on the service and run
+   `forge-cli create-admin --email … --first-name … --last-name …`.
+
 ## License
 
 Proprietary - KamiLimu. For support contact support@kamilimu.org.

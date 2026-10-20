@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import AnyHttpUrl, BeforeValidator, Field
+from pydantic import AnyHttpUrl, BeforeValidator, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://forge:forge@localhost:5433/forge"
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
+
+    # Number of reverse proxies in front of the app (Render: 1). The client IP is
+    # read this many entries from the right of X-Forwarded-For; 0 ignores the header.
+    TRUSTED_PROXY_HOPS: int = 1
 
     # Security
     SECRET_KEY: str = "change-me-in-production-use-openssl-rand-hex-32"
@@ -95,6 +99,15 @@ class Settings(BaseSettings):
         "problem_solving",
         "professionalism",
     ]
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def use_asyncpg_driver(cls, v: str) -> str:
+        """Accept the plain ``postgres://`` URLs that hosts like Render hand out."""
+        for prefix in ("postgres://", "postgresql://"):
+            if isinstance(v, str) and v.startswith(prefix):
+                return "postgresql+asyncpg://" + v.removeprefix(prefix)
+        return v
 
     @property
     def frontend_base_url(self) -> str:
