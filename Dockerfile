@@ -26,4 +26,5 @@ USER forge
 
 EXPOSE 8000
 
-CMD ["uvicorn", "forge.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# PORT is set by Render; proxy headers give correct scheme/host behind its load balancer.
+CMD ["sh", "-c", "exec uvicorn forge.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]

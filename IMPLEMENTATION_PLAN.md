@@ -213,7 +213,7 @@ This document tracks all backend API implementation tasks for the Forge KamiLimu
   - Create email templates for invitations
   - Test email delivery
 
-- [ ] **Task 1.8.3**: Deploy backend to VM with Docker — Dockerfile and Compose done; nginx and SSL pending
+- [ ] **Task 1.8.3**: Deploy backend with Docker — moving to Render (render.yaml); dev environment first, production pending
   - Create Dockerfile for FastAPI app
   - Set up Docker Compose
   - Configure reverse proxy (nginx)
