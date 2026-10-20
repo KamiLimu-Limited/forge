@@ -23,7 +23,9 @@ async def create_admin_user(
 ) -> None:
     """Create the initial admin user in the database."""
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
-    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async_session = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     async with async_session() as db:
         # Check if user already exists
@@ -72,7 +74,7 @@ async def create_admin_user(
 
         await db.commit()
 
-        print(f"\nAdmin user created successfully!")
+        print("\nAdmin user created successfully!")
         print(f"  Email: {email}")
         print(f"  Name: {first_name} {last_name}")
         print(f"  ID: {user.id}")

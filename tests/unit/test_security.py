@@ -1,6 +1,6 @@
 """Unit tests for security utilities."""
 
-import pytest
+import bcrypt
 
 from forge.core.security import (
     generate_secure_token,
@@ -14,12 +14,19 @@ class TestPasswordHashing:
     """Tests for password hashing functions."""
 
     def test_hash_password_returns_hash(self):
-        """Test that hash_password returns a bcrypt hash."""
+        """New hashes use Argon2id."""
         password = "TestPassword123"
         hashed = hash_password(password)
 
         assert hashed != password
-        assert hashed.startswith("$2b$")
+        assert hashed.startswith("$argon2id$")
+
+    def test_verify_legacy_bcrypt_hash(self):
+        """Hashes created before the Argon2 switch still verify."""
+        legacy = bcrypt.hashpw(b"TestPassword123", bcrypt.gensalt()).decode()
+
+        assert verify_password("TestPassword123", legacy) is True
+        assert verify_password("WrongPassword123", legacy) is False
 
     def test_hash_password_different_for_same_input(self):
         """Test that hashing the same password twice produces different hashes."""

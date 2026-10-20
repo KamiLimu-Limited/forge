@@ -3,7 +3,7 @@
 import pytest
 from httpx import AsyncClient
 
-from forge.models import AccountState, User
+from forge.models import User
 
 
 def auth_header(token: str) -> dict[str, str]:
@@ -50,7 +50,9 @@ class TestLogin:
         assert response.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_login_suspended_user(self, client: AsyncClient, suspended_user: User):
+    async def test_login_suspended_user(
+        self, client: AsyncClient, suspended_user: User
+    ):
         """Test login with suspended account."""
         response = await client.post(
             "/api/v1/auth/login",
@@ -105,7 +107,9 @@ class TestActivation:
         assert response.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_activate_expired_token(self, client: AsyncClient, expired_invitation):
+    async def test_activate_expired_token(
+        self, client: AsyncClient, expired_invitation
+    ):
         """Test activation with expired token."""
         response = await client.post(
             "/api/v1/auth/activate",
@@ -190,7 +194,7 @@ class TestInvite:
         )
 
         assert response.status_code == 201
-        assert response.json()["success"] is True
+        assert response.json()["email"] == "invited@test.com"
 
     @pytest.mark.asyncio
     async def test_invite_unauthorized(self, client: AsyncClient, user_token: str):
@@ -228,7 +232,7 @@ class TestInvite:
             headers=auth_header(admin_token),
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 409
         assert "already exists" in response.json()["detail"]
 
     @pytest.mark.asyncio

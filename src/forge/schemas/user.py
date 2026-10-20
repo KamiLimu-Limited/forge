@@ -1,78 +1,58 @@
-"""User-related Pydantic schemas."""
+"""User schemas."""
 
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import EmailStr, Field
+from pydantic import EmailStr
 
-from forge.models.user import AccountState, UserRole
-from forge.schemas.base import BaseSchema, TimestampSchema
+from forge.models import AccountState, UserRole
+from forge.schemas.common import Name, PageParams, RequestSchema, Schema
 
 
-class UserRoleResponse(BaseSchema):
-    """Response schema for a user's role assignment."""
-
+class UserRoleResponse(Schema):
     id: UUID
     role: UserRole
     cohort_id: UUID | None
     assigned_at: datetime
 
 
-class UserResponse(BaseSchema):
-    """Response schema for user details."""
-
+class UserSummary(Schema):
     id: UUID
     email: str
     first_name: str
     last_name: str
+
+
+class AdminUserListResponse(UserSummary):
     account_state: AccountState
     last_login_at: datetime | None
     created_at: datetime
+
+
+class UserProfileResponse(AdminUserListResponse):
+    roles: list[UserRoleResponse]
+
+
+class AdminUserDetailResponse(UserProfileResponse):
     updated_at: datetime
-    roles: list[UserRoleResponse] = []
 
 
-class UserProfileResponse(BaseSchema):
-    """Response schema for current user's profile."""
-
-    id: UUID
-    email: str
-    first_name: str
-    last_name: str
-    account_state: AccountState
-    last_login_at: datetime | None
-    created_at: datetime
-    roles: list[UserRoleResponse] = []
+class UserProfileUpdateRequest(RequestSchema):
+    first_name: Name | None = None
+    last_name: Name | None = None
 
 
-class UserProfileUpdateRequest(BaseSchema):
-    """Request schema for updating user profile."""
-
-    first_name: str | None = Field(None, min_length=1, max_length=100)
-    last_name: str | None = Field(None, min_length=1, max_length=100)
-
-
-class AdminUserUpdateRequest(BaseSchema):
-    """Request schema for admin updating a user."""
-
-    first_name: str | None = Field(None, min_length=1, max_length=100)
-    last_name: str | None = Field(None, min_length=1, max_length=100)
+class AdminUserUpdateRequest(UserProfileUpdateRequest):
     email: EmailStr | None = None
 
 
-class AdminUserListResponse(BaseSchema):
-    """Response schema for admin user list."""
-
-    id: UUID
-    email: str
-    first_name: str
-    last_name: str
-    account_state: AccountState
-    last_login_at: datetime | None
-    created_at: datetime
+class RoleAssignmentRequest(RequestSchema):
+    role: UserRole
+    cohort_id: UUID | None = None
 
 
-class AdminUserDetailResponse(UserResponse):
-    """Detailed response schema for admin viewing a user."""
-
-    pass
+class UserFilters(PageParams):
+    account_state: AccountState | None = None
+    role: UserRole | None = None
+    cohort_id: UUID | None = None
+    search: str | None = None

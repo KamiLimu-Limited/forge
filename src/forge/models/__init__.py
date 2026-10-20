@@ -1,6 +1,49 @@
 """SQLAlchemy models."""
 
-from forge.models.cohort import Cohort, CohortStatus, ProgrammeType
+from forge.models.activity import ActivityStatus, ActivityType, ExtraActivity
+from forge.models.attendance import (
+    AttendanceRecord,
+    AttendanceStatus,
+    AttendanceWindow,
+    AttendanceWindowOverride,
+    OverrideRequest,
+    OverrideRequestStatus,
+)
+from forge.models.cohort import Cohort, CohortEnrollment, CohortStatus, ProgrammeType
+from forge.models.competition import (
+    Competition,
+    CompetitionEntry,
+    CompetitionRound,
+    CompetitionStatus,
+    CompetitionType,
+    EntryStatus,
+)
+from forge.models.mentorship import (
+    IctProgressNote,
+    PeerMentorNote,
+    PeerMentorTask,
+    RatingPoint,
+    SkillRating,
+    SubmissionStatus,
+    TaskSubmission,
+)
+from forge.models.notification import (
+    CohortAnalyticsSnapshot,
+    EmailStatus,
+    Notification,
+    NotificationType,
+)
+from forge.models.programme_session import (
+    MentorRole,
+    ProgrammeSession,
+    ResourceType,
+    SessionCategory,
+    SessionMentor,
+    SessionMode,
+    SessionResource,
+    SessionStatus,
+    SessionType,
+)
 from forge.models.user import (
     AccountState,
     AuditLog,
@@ -14,12 +57,48 @@ from forge.models.user import (
 
 __all__ = [
     "AccountState",
+    "ActivityStatus",
+    "ActivityType",
+    "AttendanceRecord",
+    "AttendanceStatus",
+    "AttendanceWindow",
+    "AttendanceWindowOverride",
     "AuditLog",
     "Cohort",
+    "CohortAnalyticsSnapshot",
+    "CohortEnrollment",
     "CohortStatus",
+    "Competition",
+    "CompetitionEntry",
+    "CompetitionRound",
+    "CompetitionStatus",
+    "CompetitionType",
+    "EmailStatus",
+    "EntryStatus",
+    "ExtraActivity",
+    "IctProgressNote",
     "Invitation",
+    "MentorRole",
+    "Notification",
+    "NotificationType",
+    "OverrideRequest",
+    "OverrideRequestStatus",
     "PasswordResetToken",
+    "PeerMentorNote",
+    "PeerMentorTask",
+    "ProgrammeSession",
     "ProgrammeType",
+    "RatingPoint",
+    "ResourceType",
+    "SessionCategory",
+    "SessionMentor",
+    "SessionMode",
+    "SessionResource",
+    "SessionStatus",
+    "SessionType",
+    "SkillRating",
+    "SubmissionStatus",
+    "TaskSubmission",
     "TokenBlacklist",
     "User",
     "UserRole",

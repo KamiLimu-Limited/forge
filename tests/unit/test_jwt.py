@@ -1,8 +1,6 @@
 """Unit tests for JWT utilities."""
 
-import time
 import uuid
-from datetime import timedelta
 
 import pytest
 
@@ -11,7 +9,6 @@ from forge.core.jwt import (
     TokenType,
     create_access_token,
     create_refresh_token,
-    create_token,
     decode_token,
     get_token_expiration,
     get_token_jti,

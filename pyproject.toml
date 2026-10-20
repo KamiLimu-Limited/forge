@@ -9,11 +9,12 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.6.0",
-    "sqlalchemy>=2.0.0",
+    "sqlalchemy[asyncio]>=2.1.0",
     "alembic>=1.14.0",
     "asyncpg>=0.30.0",
-    "python-jose[cryptography]>=3.3.0",
-    "bcrypt>=4.0.0",
+    "pyjwt>=2.10.0",
+    "pwdlib[argon2,bcrypt]>=0.2.1",
+    "cryptography>=43.0.0",
     "python-multipart>=0.0.12",
     "resend>=2.5.0",
     "httpx>=0.28.0",
@@ -28,7 +29,6 @@ dev = [
     "httpx>=0.28.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
-    "aiosqlite>=0.20.0",
 ]
 
 [project.scripts]
@@ -66,8 +66,24 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["resend.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "-v --cov=forge --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["forge"]
+# SQLAlchemy's asyncio layer runs ORM code inside greenlets.
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+omit = ["src/forge/cli.py"]
+exclude_also = ["if TYPE_CHECKING:"]
