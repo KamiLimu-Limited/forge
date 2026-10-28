@@ -397,7 +397,14 @@ async def create_override_request(
         db,
         committee,
         NotificationType.OVERRIDE_SUBMITTED,
-        {"mentee": mentee.full_name, "title": session.title, "reason": data.reason},
+        {
+            "mentee": mentee.full_name,
+            "title": session.title,
+            "starts_at": session.starts_at,
+            "ends_at": session.ends_at,
+            "submitted_at": _now(),
+            "reason": data.reason,
+        },
         resource_type="override_request",
         resource_id=request.id,
     )
@@ -469,6 +476,8 @@ async def review_override_request(
     request.review_reason = data.reason
     context: dict[str, object] = {
         "title": request.session.title,
+        "starts_at": request.session.starts_at,
+        "ends_at": request.session.ends_at,
         "reason": data.reason or "",
     }
 
