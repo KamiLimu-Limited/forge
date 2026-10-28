@@ -125,7 +125,7 @@ async def resend_invitation(
 ) -> InvitationResponse:
     """Issue a fresh link (new token, renewed expiry) and email it again."""
     invitation = await user_service.renew_invitation(db, invitation_id, admin)
-    queue_invitation_emails(background_tasks, [invitation])
+    await queue_invitation_emails(db, background_tasks, [invitation])
     return InvitationResponse.model_validate(invitation)
 
 

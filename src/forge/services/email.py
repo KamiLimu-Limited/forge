@@ -228,45 +228,96 @@ async def send_email(
     return response
 
 
-async def send_invitation_email(
-    to: str, first_name: str, invitation_token: str
-) -> None:
+# Mirrors ROLE_LABELS in the frontend so emails name roles the way the app does.
+ROLE_LABELS = {
+    "mentee": "Mentee",
+    "peer_mentor_1:1": "1:1 Peer Mentor",
+    "peer_mentor_ict": "ICT Peer Mentor",
+    "professional_mentor": "Professional Mentor",
+    "committee": "Committee",
+    "partner": "Partner",
+    "alumni": "Alumni",
+    "admin": "System Admin",
+}
+
+
+def _plural(n: int, unit: str) -> str:
+    return f"{n} {unit}" if n == 1 else f"{n} {unit}s"
+
+
+def _invitation_sentence(roles: Sequence[str], cohort_name: str | None) -> list[str]:
+    labels = [ROLE_LABELS.get(r, r.replace("_", " ").title()) for r in roles]
+    if not labels:
+        return ["You've been invited to the KamiLimu dashboard. "]
+    article = "an" if labels[0][0] in "AEIOU" else "a"
+    parts = ["You've been invited to the KamiLimu dashboard as ", f"{article} "]
+    for i, label in enumerate(labels):
+        if i:
+            parts.append(" and " if i == len(labels) - 1 else ", ")
+        parts.append(Strong(label))
+    if cohort_name:
+        parts += [" in ", Strong(cohort_name)]
+    parts.append(". ")
+    return parts
+
+
+def invitation_email(
+    first_name: str,
+    invitation_token: str,
+    roles: Sequence[str] = (),
+    cohort_name: str | None = None,
+) -> EmailContent:
     url = f"{settings.frontend_base_url}/activate?token={invitation_token}"
+    paragraph = _invitation_sentence(roles, cohort_name)
+    paragraph.append("Set a password to activate your account.")
+    if "mentee" in roles:
+        paragraph.append(
+            " You'll use it to record attendance, log activities and follow your "
+            "progress through the programme."
+        )
+    expiry = _plural(settings.INVITATION_TOKEN_EXPIRE_DAYS, "day")
+    return render_email(
+        subject="You're invited to KamiLimu",
+        heading="Activate your KamiLimu account",
+        first_name=first_name,
+        paragraphs=[paragraph],
+        action=("Activate account", url),
+        notes=[
+            f"This link expires in {expiry}. If you weren't expecting this "
+            "invitation, you can ignore this email."
+        ],
+        footer_reason="You're getting this because a KamiLimu admin invited this address.",
+    )
+
+
+def password_reset_email(to: str, first_name: str, reset_token: str) -> EmailContent:
+    url = f"{settings.frontend_base_url}/reset-password?token={reset_token}"
+    expiry = _plural(settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS, "hour")
+    return render_email(
+        subject="Reset your KamiLimu password",
+        heading="Reset your password",
+        first_name=first_name,
+        paragraphs=[f"We got a request to reset the password for {to}."],
+        action=("Choose a new password", url),
+        notes=[
+            f"This link expires in {expiry} and works once. If you didn't ask for "
+            "a reset, ignore this email and your password stays the same."
+        ],
+        footer_reason="You're getting this because you have a KamiLimu account.",
+    )
+
+
+async def send_invitation_email(
+    to: str,
+    first_name: str,
+    invitation_token: str,
+    roles: Sequence[str] = (),
+    cohort_name: str | None = None,
+) -> None:
     await send_email(
-        to,
-        render_email(
-            subject="You're Invited to KamiLimu Forge",
-            heading="Welcome to KamiLimu Forge",
-            first_name=first_name,
-            paragraphs=[
-                "You have been invited to join the KamiLimu Forge platform. "
-                "Activate your account and set your password to get started."
-            ],
-            action=("Activate Account", url),
-            notes=[
-                f"This invitation link will expire in {settings.INVITATION_TOKEN_EXPIRE_DAYS} days.",
-                "If you didn't expect this invitation, you can safely ignore this email.",
-            ],
-        ),
+        to, invitation_email(first_name, invitation_token, roles, cohort_name)
     )
 
 
 async def send_password_reset_email(to: str, first_name: str, reset_token: str) -> None:
-    url = f"{settings.frontend_base_url}/reset-password?token={reset_token}"
-    await send_email(
-        to,
-        render_email(
-            subject="Reset Your KamiLimu Forge Password",
-            heading="Password Reset Request",
-            first_name=first_name,
-            paragraphs=[
-                "We received a request to reset the password for your KamiLimu Forge "
-                "account. Use the button below to set a new password."
-            ],
-            action=("Reset Password", url),
-            notes=[
-                f"This link will expire in {settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS} hours.",
-                "If you didn't request a password reset, you can safely ignore this email.",
-            ],
-        ),
-    )
+    await send_email(to, password_reset_email(to, first_name, reset_token))
