@@ -182,7 +182,7 @@ SPECS: dict[NotificationType, EmailSpec] = {
         details=(
             Row("Cohort", "$cohort"),
             Row("Your attendance", "$rate%"),
-            Row("Needed to graduate", "$threshold%"),
+            Row("Required", "$threshold%"),
         ),
         paragraphs_after=(
             "Attending and recording the sessions ahead will keep you on track.",
@@ -198,7 +198,7 @@ SPECS: dict[NotificationType, EmailSpec] = {
         details=(
             Row("Cohort", "$cohort"),
             Row("Your attendance", "$rate%"),
-            Row("Needed to graduate", "$threshold%"),
+            Row("Required", "$threshold%"),
         ),
         paragraphs_after=(
             "There's still time to close the gap by attending and recording the "

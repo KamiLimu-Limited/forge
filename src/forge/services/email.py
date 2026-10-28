@@ -68,10 +68,12 @@ def _paragraph_html(paragraph: Paragraph) -> str:
 
 def _logo(height: int, style: str) -> str:
     width = round(height * LOGO_RATIO)
+    # Font styles only affect the alt text shown while images are blocked.
     return (
         f'<img src="{html.escape(settings.email_logo_url)}" alt="KamiLimu" '
         f'width="{width}" height="{height}" style="height: {height}px; '
-        f'width: {width}px; border: 0; display: block; {style}">'
+        f"width: {width}px; border: 0; display: block; font-family: {MONO}; "
+        f'font-size: {height - 8}px; font-weight: 600; color: {INK}; {style}">'
     )
 
 
@@ -183,7 +185,7 @@ def render_email(
 {"".join(card)}
 </td></tr>
 <tr><td align="center" style="padding: 20px 8px 0; font-family: {SANS}; font-size: 13px; line-height: 1.6; color: {MUTED}; text-align: center">
-{_logo(18, "margin: 0 auto 6px")}{esc(footer_reason)}
+{_logo(18, "margin: 0 auto 14px")}{esc(footer_reason)}
 </td></tr>
 </table>
 </td></tr>
