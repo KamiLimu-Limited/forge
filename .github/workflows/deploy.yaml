@@ -70,7 +70,7 @@ jobs:
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
           RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
-          EMAIL_FROM=${{ secrets.EMAIL_FROM }}
+          EMAIL_FROM_ADDRESS=${{ secrets.EMAIL_FROM }}
           CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
           GITHUB_REPOSITORY=${{ github.repository }}
           ENVEOF
