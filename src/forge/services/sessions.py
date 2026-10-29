@@ -116,6 +116,7 @@ async def _announce(
     session: ProgrammeSession,
     kind: NotificationType,
     reason: str | None = None,
+    previous: tuple[datetime, datetime] | None = None,
 ) -> None:
     recipients = await eligible_mentee_ids(db, session)
     recipients += [m.user_id for m in session.mentors]
@@ -129,7 +130,14 @@ async def _announce(
         {
             "title": session.title,
             "starts_at": session.starts_at,
+            "ends_at": session.ends_at,
+            "location": session.location or "",
             "reason": reason or "",
+            **(
+                {"previous_starts_at": previous[0], "previous_ends_at": previous[1]}
+                if previous
+                else {}
+            ),
         },
         resource_type="session",
         resource_id=session.id,
@@ -274,6 +282,7 @@ async def reschedule_session(
         "by": str(actor.id),
         "at": datetime.now(UTC).isoformat(),
     }
+    previous = (session.starts_at, session.ends_at)
     session.original_starts_at = session.original_starts_at or session.starts_at
     session.reschedule_history = [*(session.reschedule_history or []), entry]
     session.starts_at = data.starts_at
@@ -283,7 +292,9 @@ async def reschedule_session(
 
     if session.status is SessionStatus.PUBLISHED:
         await sync_window(db, session, cohort, reset_overrides=True)
-        await _announce(db, session, NotificationType.SESSION_RESCHEDULED, data.reason)
+        await _announce(
+            db, session, NotificationType.SESSION_RESCHEDULED, data.reason, previous
+        )
     log_action(
         db,
         "reschedule_session",

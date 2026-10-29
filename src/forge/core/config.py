@@ -63,7 +63,10 @@ class Settings(BaseSettings):
     # Email (Resend)
     RESEND_API_KEY: str = ""
     EMAIL_FROM_ADDRESS: str = "noreply@kamilimu.org"
-    EMAIL_FROM_NAME: str = "KamiLimu Forge"
+    EMAIL_FROM_NAME: str = "KamiLimu"
+    EMAIL_REPLY_TO: str = ""
+    # Absolute public URL of the wordmark; defaults to the copy the frontend serves.
+    EMAIL_LOGO_URL: str = ""
     FRONTEND_URL: AnyHttpUrl = AnyHttpUrl("http://localhost:3000")
 
     # Background scheduler
@@ -112,6 +115,13 @@ class Settings(BaseSettings):
     @property
     def frontend_base_url(self) -> str:
         return str(self.FRONTEND_URL).rstrip("/")
+
+    @property
+    def email_logo_url(self) -> str:
+        return (
+            self.EMAIL_LOGO_URL
+            or f"{self.frontend_base_url}/logos/kamilimu-wordmark.png"
+        )
 
 
 @lru_cache

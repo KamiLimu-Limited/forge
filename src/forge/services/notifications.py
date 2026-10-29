@@ -27,7 +27,8 @@ from forge.models import (
 )
 from forge.schemas.notification import BroadcastRequest, NotificationFilters
 from forge.services.eligibility import eligible_mentee_ids
-from forge.services.email import render_email, send_email
+from forge.services.email import send_email
+from forge.services.email_templates import notification_email
 from forge.services.pagination import paginate
 
 logger = logging.getLogger(__name__)
@@ -254,12 +255,12 @@ async def dispatch_pending_emails(db: AsyncSession, batch_size: int = 100) -> in
     sent = 0
     for notification, user in rows:
         notification.email_attempts += 1
-        content = render_email(
-            subject=notification.title,
-            heading=notification.title,
+        content = notification_email(
+            notification.notification_type,
+            notification.meta_data,
             first_name=user.first_name,
-            paragraphs=[notification.message],
-            action=("Open Forge", settings.frontend_base_url),
+            title=notification.title,
+            message=notification.message,
         )
         try:
             result = await send_email(user.email, content)
@@ -318,7 +319,12 @@ async def send_window_closing_reminders(db: AsyncSession) -> int:
             db,
             recipients,
             NotificationType.WINDOW_CLOSING_SOON,
-            {"title": window.session.title, "closes_at": window.closes_at},
+            {
+                "title": window.session.title,
+                "starts_at": window.session.starts_at,
+                "ends_at": window.session.ends_at,
+                "closes_at": window.closes_at,
+            },
             resource_type="session",
             resource_id=window.session_id,
         )

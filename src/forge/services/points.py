@@ -452,7 +452,11 @@ async def send_graduation_warnings(db: AsyncSession) -> int:
                     db,
                     [mentee_id],
                     kind,
-                    {"rate": s.combined_rate, "threshold": cohort.graduation_threshold},
+                    {
+                        "rate": s.combined_rate,
+                        "threshold": cohort.graduation_threshold,
+                        "cohort": cohort.name,
+                    },
                     resource_type="cohort",
                     resource_id=cohort.id,
                 )

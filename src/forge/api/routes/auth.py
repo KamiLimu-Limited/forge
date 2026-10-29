@@ -4,6 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Body, File, Form, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.api.deps import (
     AccessToken,
@@ -13,7 +14,7 @@ from forge.api.deps import (
     DbSession,
     RateLimited,
 )
-from forge.models import Invitation
+from forge.models import Cohort, Invitation
 from forge.schemas.auth import (
     AccountActivationRequest,
     BulkInviteRequest,
@@ -36,15 +37,22 @@ from forge.services.email import send_invitation_email, send_password_reset_emai
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-def queue_invitation_emails(
-    background_tasks: BackgroundTasks, invitations: list[Invitation]
+async def queue_invitation_emails(
+    db: AsyncSession, background_tasks: BackgroundTasks, invitations: list[Invitation]
 ) -> None:
     for invitation in invitations:
+        cohort = (
+            await db.get(Cohort, invitation.intended_cohort_id)
+            if invitation.intended_cohort_id
+            else None
+        )
         background_tasks.add_task(
             send_invitation_email,
             to=invitation.email,
             first_name=invitation.first_name or "there",
             invitation_token=invitation.token,
+            roles=invitation.intended_roles or [],
+            cohort_name=cohort.name if cohort else None,
         )
 
 
@@ -72,7 +80,7 @@ async def invite_user(
     the user is also enrolled in that cohort.
     """
     invitation = await auth_service.create_invitation(db, data, admin)
-    queue_invitation_emails(background_tasks, [invitation])
+    await queue_invitation_emails(db, background_tasks, [invitation])
     return InvitationResponse.model_validate(invitation)
 
 
@@ -91,7 +99,7 @@ async def bulk_invite_users(
     results, invitations = await auth_service.bulk_create_invitations(
         db, data.users, data.cohort_id, admin
     )
-    queue_invitation_emails(background_tasks, invitations)
+    await queue_invitation_emails(db, background_tasks, invitations)
     return bulk_report(results)
 
 
@@ -115,7 +123,7 @@ async def bulk_invite_csv(
     results, invitations = await auth_service.bulk_create_invitations(
         db, entries, cohort_id, admin
     )
-    queue_invitation_emails(background_tasks, invitations)
+    await queue_invitation_emails(db, background_tasks, invitations)
     return bulk_report(row_errors + results)
 
 
