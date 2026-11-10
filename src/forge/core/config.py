@@ -92,15 +92,6 @@ class Settings(BaseSettings):
                 return "postgresql+asyncpg://" + v.removeprefix(prefix)
         return v
 
-    @field_validator("DATABASE_URL", mode="before")
-    @classmethod
-    def use_asyncpg_driver(cls, v: str) -> str:
-        """Accept the plain ``postgres://`` URLs that hosts like Render hand out."""
-        for prefix in ("postgres://", "postgresql://"):
-            if isinstance(v, str) and v.startswith(prefix):
-                return "postgresql+asyncpg://" + v.removeprefix(prefix)
-        return v
-
     @property
     def frontend_base_url(self) -> str:
         return str(self.FRONTEND_URL).rstrip("/")

@@ -42,7 +42,7 @@ VALIDATION = {
 }
 
 SAMPLES: dict[T, dict[str, str]] = {
-    T.WINDOW_OPENING: TRAINING,
+    T.WINDOW_OPENS: TRAINING,
     T.WINDOW_CLOSING_SOON: TRAINING,
     T.SESSION_RESCHEDULED: CAREER,
     T.SESSION_CANCELLED: {
@@ -61,25 +61,8 @@ SAMPLES: dict[T, dict[str, str]] = {
         **VALIDATION,
         "reason": "Sample reason: the request came in after the review deadline.",
     },
-    T.SESSION_PUBLISHED: {**TRAINING, "location": "Sample venue, Nairobi"},
-    T.GRADUATION_WARNING: {"rate": "78", "threshold": "80", "cohort": "Cohort 11"},
-    T.GRADUATION_AT_RISK: {"rate": "72", "threshold": "80", "cohort": "Cohort 11"},
-    T.ACTIVITY_APPROVED: {
-        "title": "Sample hackathon",
-        "type": "event",
-        "points": "5",
-    },
-    T.ACTIVITY_REJECTED: {
-        "title": "Sample hackathon",
-        "type": "event",
-        "reason": "Sample reason: we couldn't verify attendance from the link given.",
-    },
-    T.TASK_LAUNCHED: {"title": "Sample task: update your CV", "deadline": "2026-09-03"},
-    T.TASK_DEADLINE_REMINDER: {
-        "title": "Sample task: update your CV",
-        "deadline": "2026-09-03",
-    },
-    T.COHORT_INVITATION: {"cohort": "Cohort 11"},
+    T.INVITATION: {"cohort": "Cohort 11"},
+    T.PASSWORD_RESET: {},
     T.BROADCAST: {
         "title": "Sample announcement",
         "message": "Sample broadcast message from the programme team.",

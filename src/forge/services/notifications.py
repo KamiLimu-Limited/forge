@@ -27,7 +27,8 @@ from forge.models import (
 )
 from forge.schemas.notification import BroadcastRequest, NotificationFilters
 from forge.services.eligibility import COUNTED_STATUSES, eligible_mentee_ids
-from forge.services.email import render_email, send_email
+from forge.services.email import send_email
+from forge.services.email_templates import notification_email
 from forge.services.pagination import paginate
 
 logger = logging.getLogger(__name__)
