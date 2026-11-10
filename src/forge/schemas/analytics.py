@@ -8,7 +8,8 @@ from pydantic import Field
 
 from forge.models import ActivityStatus, ActivityType
 from forge.schemas.common import Schema
-from forge.schemas.points import GraduationStatus, RateBucket
+from forge.schemas.dashboard import QuestionAverage
+from forge.schemas.points import RateBucket
 
 
 class TrendPoint(Schema):
@@ -41,24 +42,25 @@ class SessionQuality(Schema):
     starts_at: datetime
     kami_limu_month: int
     responses: int
-    quality: float | None
-    usefulness: float | None
-    understanding: float | None
-    academic_application: float | None
-    career_application: float | None
+    average: float | None = Field(description="Mean of the nine question averages")
+    questions: list[QuestionAverage]
 
 
 class SessionQualityResponse(Schema):
     cohort_id: UUID
-    overall_quality: float | None
-    overall_usefulness: float | None
+    overall_average: float | None
+    questions: list[QuestionAverage]
     sessions: list[SessionQuality]
 
 
 class HealthPoint(Schema):
     month: int
-    average_rate: float
-    counts: dict[GraduationStatus, int]
+    average_core_rate: float
+    average_overall_rate: float
+    meeting_threshold: int = Field(
+        description="Mentees whose core rate was at or above the graduation threshold"
+    )
+    below_threshold: int
 
 
 class HealthTrajectoryResponse(Schema):
@@ -82,11 +84,12 @@ class ActivityEngagementResponse(Schema):
 class CohortHealthResponse(Schema):
     cohort_id: UUID
     total_mentees: int
-    counts: dict[GraduationStatus, int]
     average_core_rate: float
-    average_combined_rate: float
+    average_overall_rate: float
+    points_distributed: int
+    sessions_completed: int
+    sessions_scheduled: int
     pending_override_requests: int
-    pending_activities: int
 
 
 class CohortComparison(Schema):

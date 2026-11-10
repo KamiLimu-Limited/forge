@@ -2,14 +2,16 @@
 
 Counting rules:
 
-* A session counts for a mentee once it has started, is published or completed,
-  and applies to them (see :mod:`forge.services.eligibility`).
-* ``attended`` earns the session's points. ``not_attended``, ``missed`` and
-  ``disputed`` earn nothing. ``excused`` sessions leave the denominator.
-* Sessions with no submission whose window is still open are *upcoming* and not
-  yet counted; once the window closes they count as absent.
-* The combined rate adds approved extra-activity points to the core points earned,
-  capped at 100%. Graduation compares it with the cohort threshold.
+* A session counts for a participant once it is published (or live, completed or
+  rescheduled) and applies to them (see :mod:`forge.services.eligibility`).
+* ``present`` earns the session's points. ``absent`` and ``missed`` earn nothing.
+  ``excused`` sessions leave the denominator.
+* Sessions whose window has not closed and that have no submission are
+  *remaining*: not yet counted. Once the window closes they count as missed.
+* The core rate is core points earned over core points available. The overall
+  rate adds active extra-activity points to the points earned, capped at 100%.
+* Graduation is decided once, when the cohort graduates, on the core rate
+  against the cohort threshold.
 """
 
 import math
@@ -17,13 +19,13 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from forge.core.config import settings
 from forge.models import (
+    PARTICIPANT_ROLES,
     ActivityStatus,
     AttendanceRecord,
     AttendanceStatus,
@@ -33,8 +35,6 @@ from forge.models import (
     CohortEnrollment,
     CohortStatus,
     ExtraActivity,
-    Notification,
-    NotificationType,
     ProgrammeSession,
     SessionType,
     UserRole,
@@ -54,13 +54,6 @@ from forge.schemas.points import (
 )
 from forge.schemas.user import UserSummary
 from forge.services.eligibility import COUNTED_STATUSES, applies_to_enrollment
-from forge.services.notifications import notify
-
-ABSENT_STATUSES = (
-    AttendanceStatus.NOT_ATTENDED,
-    AttendanceStatus.MISSED,
-    AttendanceStatus.DISPUTED,
-)
 
 
 @dataclass(frozen=True)
@@ -79,15 +72,18 @@ class SessionRow:
 
 def classify(row: SessionRow, now: datetime) -> SessionOutcome:
     match row.record_status:
-        case AttendanceStatus.ATTENDED:
-            return SessionOutcome.ATTENDED
+        case AttendanceStatus.PRESENT:
+            return SessionOutcome.PRESENT
+        case AttendanceStatus.ABSENT:
+            return SessionOutcome.ABSENT
         case AttendanceStatus.EXCUSED:
             return SessionOutcome.EXCUSED
-        case status if status in ABSENT_STATUSES:
-            return SessionOutcome.ABSENT
-    if row.window_closes_at is not None and row.window_closes_at > now:
-        return SessionOutcome.UPCOMING
-    return SessionOutcome.ABSENT
+        case AttendanceStatus.MISSED:
+            return SessionOutcome.MISSED
+    closes_at = row.window_closes_at
+    if row.starts_at > now or (closes_at is not None and closes_at > now):
+        return SessionOutcome.REMAINING
+    return SessionOutcome.MISSED
 
 
 def percent(part: int, whole: int) -> float:
@@ -100,23 +96,33 @@ class Tally:
     available: int = 0
     attended: int = 0
     due: int = 0
+    absent: int = 0
+    missed: int = 0
+    missed_points: int = 0
     excused: int = 0
-    upcoming: int = 0
+    remaining: int = 0
+    remaining_points: int = 0
 
     def add(self, outcome: SessionOutcome, points: int) -> None:
         match outcome:
-            case SessionOutcome.ATTENDED:
+            case SessionOutcome.PRESENT:
                 self.earned += points
                 self.available += points
                 self.attended += 1
                 self.due += 1
-            case SessionOutcome.ABSENT:
+            case SessionOutcome.ABSENT | SessionOutcome.MISSED:
                 self.available += points
                 self.due += 1
+                if outcome is SessionOutcome.MISSED:
+                    self.missed += 1
+                    self.missed_points += points
+                else:
+                    self.absent += 1
             case SessionOutcome.EXCUSED:
                 self.excused += 1
-            case SessionOutcome.UPCOMING:
-                self.upcoming += 1
+            case SessionOutcome.REMAINING:
+                self.remaining += 1
+                self.remaining_points += points
 
     def bucket(self, key: str) -> RateBucket:
         return RateBucket(
@@ -153,26 +159,24 @@ class MenteeStats:
         return percent(self.total.earned, self.total.available)
 
     @property
-    def combined_rate(self) -> float:
+    def overall_rate(self) -> float:
         return percent(self.total_points, self.total.available)
 
-    def graduation_status(self, threshold: int, final: bool) -> GraduationStatus:
-        rate = self.combined_rate
-        if final:
-            return (
-                GraduationStatus.GRADUATED
-                if rate >= threshold
-                else GraduationStatus.NOT_GRADUATED
-            )
-        if rate >= threshold + settings.GRADUATION_WARNING_MARGIN:
-            return GraduationStatus.ON_TRACK
-        if rate >= threshold:
-            return GraduationStatus.WARNING
-        return GraduationStatus.AT_RISK
+    def meets_threshold(self, threshold: int) -> bool:
+        return self.core_rate >= threshold
+
+    def graduation_status(self, threshold: int, final: bool) -> GraduationStatus | None:
+        if not final:
+            return None
+        return (
+            GraduationStatus.GRADUATED
+            if self.meets_threshold(threshold)
+            else GraduationStatus.NOT_GRADUATED
+        )
 
     def points_to_threshold(self, threshold: int) -> int:
         return max(
-            math.ceil(self.total.available * threshold / 100) - self.total_points, 0
+            math.ceil(self.total.available * threshold / 100) - self.total.earned, 0
         )
 
 
@@ -203,7 +207,7 @@ def tally(
                 session_type=row.session_type,
                 points=row.points,
                 outcome=outcome,
-                points_earned=row.points if outcome is SessionOutcome.ATTENDED else 0,
+                points_earned=row.points if outcome is SessionOutcome.PRESENT else 0,
             )
         )
     for mentee_id, points in extra_points.items():
@@ -257,7 +261,6 @@ async def load_rows(
         .where(
             ProgrammeSession.cohort_id == cohort_id,
             ProgrammeSession.status.in_(COUNTED_STATUSES),
-            ProgrammeSession.starts_at <= now,
         )
         .order_by(ProgrammeSession.starts_at)
     )
@@ -273,7 +276,7 @@ async def load_extra_points(
         select(ExtraActivity.mentee_id, func.sum(ExtraActivity.points_awarded))
         .where(
             ExtraActivity.cohort_id == cohort_id,
-            ExtraActivity.status == ActivityStatus.APPROVED,
+            ExtraActivity.status == ActivityStatus.ACTIVE,
         )
         .group_by(ExtraActivity.mentee_id)
     )
@@ -285,7 +288,7 @@ async def load_extra_points(
 async def compute_stats(
     db: AsyncSession, cohort_id: uuid.UUID, mentee_ids: list[uuid.UUID] | None = None
 ) -> dict[uuid.UUID, MenteeStats]:
-    """Stats for the given mentees (default: everyone in the cohort), keyed by mentee id."""
+    """Stats for the given participants (default: everyone in the cohort), keyed by id."""
     now = datetime.now(UTC)
     rows = await load_rows(db, cohort_id, mentee_ids, now)
     stats = tally(
@@ -312,8 +315,12 @@ def breakdown(stats: MenteeStats) -> PointsBreakdownResponse:
         total_points=stats.total_points,
         sessions_attended=stats.total.attended,
         sessions_due=stats.total.due,
+        sessions_absent=stats.total.absent,
+        sessions_missed=stats.total.missed,
+        points_missed=stats.total.missed_points,
         sessions_excused=stats.total.excused,
-        sessions_upcoming=stats.total.upcoming,
+        sessions_remaining=stats.total.remaining,
+        points_remaining=stats.total.remaining_points,
     )
 
 
@@ -325,7 +332,7 @@ async def detailed_breakdown(
         .where(
             ExtraActivity.cohort_id == stats.cohort_id,
             ExtraActivity.mentee_id == stats.mentee_id,
-            ExtraActivity.status == ActivityStatus.APPROVED,
+            ExtraActivity.status == ActivityStatus.ACTIVE,
         )
         .order_by(ExtraActivity.date)
     )
@@ -349,7 +356,7 @@ def rates(stats: MenteeStats) -> AttendanceRateResponse:
         mentee_id=stats.mentee_id,
         cohort_id=stats.cohort_id,
         core_rate=stats.core_rate,
-        combined_rate=stats.combined_rate,
+        overall_rate=stats.overall_rate,
         by_month=[t.bucket(str(m)) for m, t in sorted(stats.by_month.items())],
         by_track=[t.bucket(k) for k, t in sorted(stats.by_track.items())],
         by_session_type=[t.bucket(k) for k, t in sorted(stats.by_type.items())],
@@ -357,31 +364,42 @@ def rates(stats: MenteeStats) -> AttendanceRateResponse:
 
 
 def graduation(stats: MenteeStats, cohort: Cohort) -> GraduationStatusResponse:
-    final = cohort.status is CohortStatus.COMPLETED
+    final = is_final(cohort)
     return GraduationStatusResponse(
         mentee_id=stats.mentee_id,
         cohort_id=stats.cohort_id,
         status=stats.graduation_status(cohort.graduation_threshold, final),
-        combined_rate=stats.combined_rate,
+        core_rate=stats.core_rate,
+        overall_rate=stats.overall_rate,
         threshold=cohort.graduation_threshold,
-        warning_threshold=cohort.graduation_threshold
-        + settings.GRADUATION_WARNING_MARGIN,
         points_to_threshold=stats.points_to_threshold(cohort.graduation_threshold),
         is_final=final,
     )
 
 
+def is_final(cohort: Cohort) -> bool:
+    return cohort.status in (CohortStatus.COMPLETED, CohortStatus.ARCHIVED)
+
+
 async def mentee_enrollments(
-    db: AsyncSession, cohort_id: uuid.UUID
+    db: AsyncSession,
+    cohort_id: uuid.UUID,
+    roles: Iterable[UserRole] = (UserRole.MENTEE,),
 ) -> list[CohortEnrollment]:
     return list(
         await db.scalars(
             select(CohortEnrollment).where(
                 CohortEnrollment.cohort_id == cohort_id,
-                CohortEnrollment.role == UserRole.MENTEE,
+                CohortEnrollment.role.in_(list(roles)),
             )
         )
     )
+
+
+async def participant_enrollments(
+    db: AsyncSession, cohort_id: uuid.UUID
+) -> list[CohortEnrollment]:
+    return await mentee_enrollments(db, cohort_id, PARTICIPANT_ROLES)
 
 
 async def graduation_report(
@@ -389,7 +407,7 @@ async def graduation_report(
 ) -> GraduationReportResponse:
     enrollments = await mentee_enrollments(db, cohort.id)
     stats = await compute_stats(db, cohort.id, [e.user_id for e in enrollments])
-    final = cohort.status is CohortStatus.COMPLETED
+    final = is_final(cohort)
     entries = [
         GraduationReportEntry(
             mentee=UserSummary.model_validate(e.user),
@@ -397,17 +415,18 @@ async def graduation_report(
             ict_track=e.ict_track,
             total_points=stats[e.user_id].total_points,
             core_rate=stats[e.user_id].core_rate,
-            combined_rate=stats[e.user_id].combined_rate,
+            overall_rate=stats[e.user_id].overall_rate,
             status=stats[e.user_id].graduation_status(
                 cohort.graduation_threshold, final
             ),
         )
         for e in enrollments
     ]
-    entries.sort(key=lambda e: (e.combined_rate, e.mentee.last_name))
-    counts = dict.fromkeys(GraduationStatus, 0)
+    entries.sort(key=lambda e: (e.core_rate, e.mentee.last_name))
+    counts = dict.fromkeys(GraduationStatus, 0) if final else {}
     for entry in entries:
-        counts[entry.status] += 1
+        if entry.status is not None:
+            counts[entry.status] += 1
     return GraduationReportResponse(
         cohort_id=cohort.id,
         threshold=cohort.graduation_threshold,
@@ -415,51 +434,3 @@ async def graduation_report(
         counts=counts,
         mentees=entries,
     )
-
-
-async def send_graduation_warnings(db: AsyncSession) -> int:
-    """Warn at-risk and borderline mentees in active cohorts, at most once a week each."""
-    week_ago = datetime.now(UTC) - timedelta(days=7)
-    sent = 0
-    for cohort in await db.scalars(
-        select(Cohort).where(
-            Cohort.status == CohortStatus.ACTIVE, Cohort.deleted_at.is_(None)
-        )
-    ):
-        for mentee_id, s in (await compute_stats(db, cohort.id)).items():
-            status = s.graduation_status(cohort.graduation_threshold, final=False)
-            if (
-                status not in (GraduationStatus.WARNING, GraduationStatus.AT_RISK)
-                or s.total.due == 0
-            ):
-                continue
-            kind = (
-                NotificationType.GRADUATION_AT_RISK
-                if status is GraduationStatus.AT_RISK
-                else NotificationType.GRADUATION_WARNING
-            )
-            recently = await db.scalar(
-                select(
-                    exists().where(
-                        Notification.user_id == mentee_id,
-                        Notification.notification_type == kind,
-                        Notification.created_at >= week_ago,
-                    )
-                )
-            )
-            if not recently:
-                notify(
-                    db,
-                    [mentee_id],
-                    kind,
-                    {
-                        "rate": s.combined_rate,
-                        "threshold": cohort.graduation_threshold,
-                        "cohort": cohort.name,
-                    },
-                    resource_type="cohort",
-                    resource_id=cohort.id,
-                )
-                sent += 1
-    await db.commit()
-    return sent

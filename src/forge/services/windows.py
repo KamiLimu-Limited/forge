@@ -1,8 +1,8 @@
 """Attendance window rules.
 
-Windows open when a session starts. Thursday sessions close 24h after the end,
-Saturday sessions 48h after, and peer mentorship sessions at their explicit
-deadline (or the cohort/default allowance). All durations are configurable.
+Windows open when a session starts. Thursday and Saturday sessions close a
+cohort-configured number of hours after the session ends (24h and 48h by
+default); peer mentorship sessions (tasks) close at their end time, the deadline.
 """
 
 import uuid
@@ -11,7 +11,6 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from forge.core.config import settings
 from forge.models import (
     AttendanceWindow,
     AttendanceWindowOverride,
@@ -24,25 +23,14 @@ from forge.models import (
 def compute_window(
     session: ProgrammeSession, cohort: Cohort
 ) -> tuple[datetime, datetime]:
-    opens_at = session.starts_at
     match session.category:
         case SessionCategory.THURSDAY:
-            closes_at = session.ends_at + timedelta(
-                hours=settings.THURSDAY_WINDOW_HOURS
-            )
+            closes_at = session.ends_at + timedelta(hours=cohort.thursday_window_hours)
         case SessionCategory.SATURDAY:
-            closes_at = session.ends_at + timedelta(
-                hours=settings.SATURDAY_WINDOW_HOURS
-            )
+            closes_at = session.ends_at + timedelta(hours=cohort.saturday_window_hours)
         case SessionCategory.PEER_MENTORSHIP:
-            hours = (
-                cohort.peer_mentorship_deadline_hours
-                or settings.PEER_MENTORSHIP_WINDOW_HOURS
-            )
-            closes_at = session.attendance_deadline or session.ends_at + timedelta(
-                hours=hours
-            )
-    return opens_at, closes_at
+            closes_at = session.ends_at
+    return session.starts_at, closes_at
 
 
 async def get_window(

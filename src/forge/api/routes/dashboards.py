@@ -8,21 +8,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.api.deps import (
     ActiveUser,
-    CommitteeUser,
     DbSession,
     IctPeerMentorUser,
-    MenteeUser,
+    ManagerUser,
     OneOnOnePeerMentorUser,
+    ParticipantUser,
     ProfessionalMentorUser,
+    ProgramLeadUser,
+    StaffUser,
 )
 from forge.api.routes.sessions import VisibleSession
-from forge.models import (
-    ActivityStatus,
-    Cohort,
-    CohortEnrollment,
-    OverrideRequestStatus,
-    User,
-)
+from forge.models import Cohort, CohortEnrollment, OverrideRequestStatus, User
 from forge.schemas.activity import ActivityFilters, ExtraActivityResponse
 from forge.schemas.analytics import (
     AttendanceTrendResponse,
@@ -36,18 +32,22 @@ from forge.schemas.dashboard import (
     GroupOverview,
     MenteeDrilldown,
     MenteeOverview,
-    MenteeSummary,
     SessionAttendanceSummary,
     SessionFeedbackResponse,
     TrackOverview,
 )
-from forge.schemas.points import GraduationStatus, RateBucket, SessionPointsEntry
+from forge.schemas.graduation import GraduationPanel
+from forge.schemas.points import RateBucket, SessionPointsEntry
 from forge.services import activities as activity_service
 from forge.services import analytics as analytics_service
 from forge.services import attendance as attendance_service
 from forge.services import dashboard as dashboard_service
+from forge.services import graduation as graduation_service
 from forge.services import points as points_service
-from forge.services.access import ensure_cohort_staff, get_mentee_enrollment_or_404
+from forge.services.access import (
+    ensure_cohort_staff,
+    get_participant_enrollment_or_404,
+)
 from forge.services.cohorts import get_visible_cohort
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboards"])
@@ -58,17 +58,17 @@ CohortParam = Annotated[
 ]
 
 
-async def mentee_enrollment(
-    mentee: MenteeUser, db: DbSession, cohort_id: CohortParam = None
+async def participant_enrollment(
+    user: ParticipantUser, db: DbSession, cohort_id: CohortParam = None
 ) -> CohortEnrollment:
-    return await get_mentee_enrollment_or_404(db, mentee.id, cohort_id)
+    return await get_participant_enrollment_or_404(db, user.id, cohort_id)
 
 
-OwnEnrollment = Annotated[CohortEnrollment, Depends(mentee_enrollment)]
+OwnEnrollment = Annotated[CohortEnrollment, Depends(participant_enrollment)]
 
 
-class CohortQueueParams(PageParams):
-    cohort_id: UUID
+class OverrideQueueParams(PageParams):
+    cohort_id: UUID | None = None
 
 
 async def resolve_committee_cohort(
@@ -80,7 +80,7 @@ async def resolve_committee_cohort(
 
 
 async def committee_cohort(
-    user: CommitteeUser, db: DbSession, cohort_id: Annotated[UUID, Query()]
+    user: StaffUser, db: DbSession, cohort_id: Annotated[UUID, Query()]
 ) -> Cohort:
     return await resolve_committee_cohort(db, user, cohort_id)
 
@@ -88,16 +88,17 @@ async def committee_cohort(
 CommitteeCohort = Annotated[Cohort, Depends(committee_cohort)]
 
 
-# Mentee
+# Mentee (also used by peer mentors for their own participation)
 
 
 @router.get("/mentee/overview")
 async def mentee_overview(
-    mentee: MenteeUser, enrollment: OwnEnrollment, db: DbSession
+    user: ParticipantUser, enrollment: OwnEnrollment, db: DbSession
 ) -> MenteeOverview:
-    """Headline numbers: attendance and graduation status, points, next session and
-    anything needing action (open windows, pending overrides, unread notifications)."""
-    return await dashboard_service.mentee_overview(db, mentee, enrollment)
+    """Headline numbers: core and overall rate, points with the missed and
+    remaining buckets, the next session, and anything needing action (open windows,
+    pending extension requests, unread notifications). **Mentees and peer mentors.**"""
+    return await dashboard_service.mentee_overview(db, user, enrollment)
 
 
 @router.get("/mentee/attendance/monthly")
@@ -118,20 +119,28 @@ async def mentee_by_track(enrollment: OwnEnrollment, db: DbSession) -> list[Rate
 
 @router.get("/mentee/attendance/history")
 async def mentee_history(
-    enrollment: OwnEnrollment, db: DbSession
+    enrollment: OwnEnrollment,
+    db: DbSession,
+    kami_limu_month: Annotated[int | None, Query(ge=1, le=24)] = None,
 ) -> list[SessionPointsEntry]:
-    """Every counted session with its outcome, most recent first."""
+    """Every session that applies to you with its outcome, most recent first,
+    optionally for one KamiLimu month."""
     stats = await points_service.mentee_stats(db, enrollment)
-    return sorted(stats.sessions, key=lambda s: s.starts_at, reverse=True)
+    sessions = [
+        s
+        for s in stats.sessions
+        if kami_limu_month is None or s.kami_limu_month == kami_limu_month
+    ]
+    return sorted(sessions, key=lambda s: s.starts_at, reverse=True)
 
 
 @router.get("/mentee/extra-activities")
 async def mentee_activities(
-    filters: Annotated[ActivityFilters, Query()], mentee: MenteeUser, db: DbSession
+    filters: Annotated[ActivityFilters, Query()], user: ParticipantUser, db: DbSession
 ) -> Page[ExtraActivityResponse]:
-    """Your extra-activity log."""
+    """Your extra-activity log across the five log types."""
     activities, total = await activity_service.list_activities(
-        db, mentee, filters, mine=True
+        db, user, filters, mine=True
     )
     return Page[ExtraActivityResponse].build(activities, total, filters)
 
@@ -143,7 +152,7 @@ async def mentee_activities(
 async def peer_mentor_group(
     mentor: OneOnOnePeerMentorUser, db: DbSession, cohort_id: CohortParam = None
 ) -> GroupOverview:
-    """Your mentees' points, rates and graduation status, lowest rate first."""
+    """Your mentees' core rate, overall rate and points, lowest core rate first."""
     return await dashboard_service.group_overview(db, mentor, cohort_id)
 
 
@@ -154,21 +163,9 @@ async def peer_mentor_mentee(
     db: DbSession,
     cohort_id: CohortParam = None,
 ) -> MenteeDrilldown:
-    """Full drill-down on one mentee in your group."""
+    """Full read-only drill-down on one mentee in your group, including their
+    objectives and their session ratings and feedback."""
     return await dashboard_service.mentee_drilldown(db, mentor, mentee_id, cohort_id)
-
-
-@router.get("/peer-mentor/at-risk")
-async def peer_mentor_at_risk(
-    mentor: OneOnOnePeerMentorUser, db: DbSession, cohort_id: CohortParam = None
-) -> list[MenteeSummary]:
-    """Mentees in your group with `warning` or `at_risk` status."""
-    group = await dashboard_service.group_overview(db, mentor, cohort_id)
-    return [
-        m
-        for m in group.mentees
-        if m.status in (GraduationStatus.WARNING, GraduationStatus.AT_RISK)
-    ]
 
 
 # ICT peer mentor
@@ -197,7 +194,8 @@ async def ict_track_sessions(
 async def professional_mentor_sessions(
     mentor: ProfessionalMentorUser, db: DbSession
 ) -> list[SessionAttendanceSummary]:
-    """Sessions you lead or co-mentor, with attendance and feedback summaries."""
+    """Sessions you lead or co-mentor, with attendance and the average of each of
+    the nine rating questions."""
     return await dashboard_service.professional_mentor_sessions(db, mentor)
 
 
@@ -205,8 +203,9 @@ async def professional_mentor_sessions(
 async def session_feedback(
     session: VisibleSession, user: ActiveUser, db: DbSession
 ) -> SessionFeedbackResponse:
-    """Average ratings and feedback from attendees, with anonymous respondent ids.
-    **Staff and the session's mentors.**"""
+    """Average of each of the nine rating questions, and each attendee's ratings
+    and feedback. **Staff and the session's mentors**; respondents are anonymous
+    for mentors."""
     return await dashboard_service.session_feedback(db, user, session)
 
 
@@ -215,40 +214,9 @@ async def session_feedback(
 
 @router.get("/committee/cohort-health")
 async def cohort_health(cohort: CommitteeCohort, db: DbSession) -> CohortHealthResponse:
-    """Programme-wide summary: status counts, average rates and review queues."""
+    """Programme-wide summary: enrolment, average rates, points distributed,
+    sessions completed and the pending extension requests."""
     return await analytics_service.cohort_health(db, cohort)
-
-
-@router.get("/committee/override-queue")
-async def override_queue(
-    params: Annotated[CohortQueueParams, Query()], user: CommitteeUser, db: DbSession
-) -> Page[OverrideRequestResponse]:
-    """Pending attendance override requests for the cohort."""
-    cohort = await resolve_committee_cohort(db, user, params.cohort_id)
-    filters = OverrideFilters(
-        page=params.page,
-        page_size=params.page_size,
-        cohort_id=cohort.id,
-        status=OverrideRequestStatus.PENDING,
-    )
-    requests, total = await attendance_service.list_override_requests(db, user, filters)
-    return Page[OverrideRequestResponse].build(requests, total, filters)
-
-
-@router.get("/committee/activities-queue")
-async def activities_queue(
-    params: Annotated[CohortQueueParams, Query()], user: CommitteeUser, db: DbSession
-) -> Page[ExtraActivityResponse]:
-    """Extra activities awaiting validation in the cohort."""
-    cohort = await resolve_committee_cohort(db, user, params.cohort_id)
-    filters = ActivityFilters(
-        page=params.page,
-        page_size=params.page_size,
-        cohort_id=cohort.id,
-        status=ActivityStatus.PENDING,
-    )
-    activities, total = await activity_service.list_activities(db, user, filters)
-    return Page[ExtraActivityResponse].build(activities, total, filters)
 
 
 @router.get("/committee/analytics/attendance-trends")
@@ -273,3 +241,36 @@ async def committee_session_quality(
 ) -> SessionQualityResponse:
     """Average feedback ratings per session."""
     return await analytics_service.session_quality(db, cohort)
+
+
+# System Admin
+
+
+@router.get("/admin/override-queue")
+async def override_queue(
+    params: Annotated[OverrideQueueParams, Query()], user: ManagerUser, db: DbSession
+) -> Page[OverrideRequestResponse]:
+    """Pending window extension requests, optionally for one cohort.
+    **System Admin or Program Lead.**"""
+    filters = OverrideFilters(
+        page=params.page,
+        page_size=params.page_size,
+        cohort_id=params.cohort_id,
+        status=OverrideRequestStatus.PENDING,
+    )
+    requests, total = await attendance_service.list_override_requests(db, user, filters)
+    return Page[OverrideRequestResponse].build(requests, total, filters)
+
+
+# Program Lead
+
+
+@router.get("/program-lead/graduation")
+async def graduation_panel(
+    user: ProgramLeadUser, db: DbSession, cohort_id: Annotated[UUID, Query()]
+) -> GraduationPanel:
+    """The graduation panel: the preview, whether the cohort has graduated and
+    whether Graduate Cohort is available (with the reasons when it is not).
+    **Program Lead.**"""
+    cohort = await get_visible_cohort(db, user, cohort_id)
+    return await graduation_service.panel(db, cohort)

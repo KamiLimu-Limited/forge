@@ -3,7 +3,8 @@
 import pytest
 from httpx import AsyncClient
 
-from forge.models import User
+from forge.models import User, UserRole
+from tests.conftest import Factory, Programme, token_for
 
 
 def auth_header(token: str) -> dict[str, str]:
@@ -240,3 +241,88 @@ class TestAdminUserManagement:
 
         assert response.status_code == 200
         assert response.json()["success"] is True
+
+
+async def test_profile_fields(client: AsyncClient, programme: Programme):
+    headers = token_for(programme.mentees[0])
+
+    updated = await client.patch(
+        "/api/v1/users/me",
+        json={
+            "university": "Strathmore University",
+            "programme_of_study": "Computer Science",
+            "degree_level": "bachelors",
+            "gender": "male",
+            "phone": "+254 700 000000",
+            "birthday": "2003-04-05",
+            "social_links": {"github": "https://github.com/mentee0"},
+        },
+        headers=headers,
+    )
+    no_track = await client.patch(
+        "/api/v1/users/me", json={"ict_track": "data"}, headers=headers
+    )
+    bad_phone = await client.patch(
+        "/api/v1/users/me", json={"phone": "call me"}, headers=headers
+    )
+    admin_view = (
+        await client.get(
+            f"/api/v1/admin/users/{programme.mentees[0].id}",
+            headers=token_for(programme.admin),
+        )
+    ).json()
+
+    body = updated.json()
+    assert (body["university"], body["degree_level"]) == (
+        "Strathmore University",
+        "bachelors",
+    )
+    assert body["social_links"]["github"] == "https://github.com/mentee0"
+    assert body["ict_track"] == "web"
+    assert body["is_alumni"] is False
+    assert no_track.status_code == 422
+    assert bad_phone.status_code == 422
+    assert admin_view["birthday"] == "2003-04-05"
+    assert admin_view["ict_track"] == "web"
+
+
+async def test_my_cohorts_and_active_context(
+    client: AsyncClient, programme: Programme, factory: Factory
+):
+    other = await factory.cohort(name="Cohort 12")
+    await factory.enroll(programme.peer_mentor, other, UserRole.MENTEE)
+    headers = token_for(programme.peer_mentor)
+
+    cohorts = (await client.get("/api/v1/users/me/cohorts", headers=headers)).json()
+    wrong_role = await client.put(
+        "/api/v1/users/me/active-cohort",
+        json={"cohort_id": str(other.id), "role": "peer_mentor_1_1"},
+        headers=headers,
+    )
+    switched = await client.put(
+        "/api/v1/users/me/active-cohort",
+        json={"cohort_id": str(other.id), "role": "mentee"},
+        headers=headers,
+    )
+    me = (await client.get("/api/v1/users/me", headers=headers)).json()
+
+    assert {c["cohort"]["id"]: c["roles"] for c in cohorts} == {
+        str(programme.cohort.id): ["peer_mentor_1_1"],
+        str(other.id): ["mentee"],
+    }
+    assert wrong_role.status_code == 400
+    assert switched.status_code == 200
+    assert (me["active_cohort_id"], me["active_role"]) == (str(other.id), "mentee")
+
+
+async def test_role_enum(client: AsyncClient, programme: Programme):
+    url = f"/api/v1/admin/users/{programme.outsider.id}/roles"
+    headers = token_for(programme.admin)
+
+    partner = await client.post(url, json={"role": "partner"}, headers=headers)
+    lead = await client.post(url, json={"role": "program_lead"}, headers=headers)
+    old_name = await client.post(url, json={"role": "peer_mentor_1:1"}, headers=headers)
+
+    assert partner.status_code == 422
+    assert lead.status_code == 201
+    assert old_name.status_code == 422

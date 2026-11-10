@@ -5,16 +5,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Query, status
 
-from forge.api.deps import ActiveUser, DbSession
-from forge.models import ProgrammeSession
+from forge.api.deps import ActiveUser, DbSession, ParticipantUser
+from forge.models import ProgrammeSession, SessionNote
 from forge.schemas.common import Page
 from forge.schemas.session import (
+    InProgressSession,
     MentorsUpdateRequest,
     ResourcesUpdateRequest,
     SessionCancelRequest,
     SessionCreateRequest,
     SessionDetailResponse,
     SessionFilters,
+    SessionNoteRequest,
+    SessionNoteResponse,
     SessionRescheduleRequest,
     SessionResponse,
     SessionUpdateRequest,
@@ -37,11 +40,13 @@ VisibleSession = Annotated[ProgrammeSession, Depends(visible_session)]
 async def create_session(
     data: SessionCreateRequest, user: ActiveUser, db: DbSession
 ) -> ProgrammeSession:
-    """Schedule a session. **Committee of the cohort or admin.**
+    """Schedule a session. **System Admin or Program Lead**; the Program Delivery
+    Lead may create peer mentorship sessions in their cohort.
 
-    Publishing (`status: published`) opens an attendance window based on the
-    category (Thursday: 24h after the end, Saturday: 48h, peer mentorship: the
-    explicit deadline) and notifies the cohort.
+    Publishing (`status: published`) sets the attendance window from the category:
+    Thursday and Saturday windows close the cohort's configured hours after
+    `ends_at` (24h and 48h by default); a peer mentorship session (a task) closes
+    at `ends_at`, its deadline.
     """
     return await session_service.create_session(db, data, user)
 
@@ -56,6 +61,15 @@ async def list_sessions(
     return Page[SessionResponse].build(sessions, total, filters)
 
 
+@router.get("/in-progress")
+async def list_in_progress(
+    user: ParticipantUser, db: DbSession
+) -> list[InProgressSession]:
+    """The caller's sessions whose attendance window is open, including tasks
+    before their deadline and windows reopened for them, soonest closing first."""
+    return await session_service.in_progress(db, user)
+
+
 @router.get("/{session_id}", response_model=SessionDetailResponse)
 async def get_session(session: VisibleSession) -> ProgrammeSession:
     """Session details including mentors, resources, reschedule history and its
@@ -68,7 +82,7 @@ async def update_session(
     data: SessionUpdateRequest, session: VisibleSession, user: ActiveUser, db: DbSession
 ) -> ProgrammeSession:
     """Edit session details, publish a draft or mark it completed. Use
-    `/reschedule` to change its time."""
+    `/reschedule` to change its time. Same access as creating it."""
     return await session_service.update_session(db, session, data, user)
 
 
@@ -92,9 +106,9 @@ async def reschedule_session(
     user: ActiveUser,
     db: DbSession,
 ) -> ProgrammeSession:
-    """Move a session. The original time and every change are kept in
-    `reschedule_history`, the attendance window is recomputed (dropping
-    per-mentee overrides) and attendees are notified."""
+    """Move a session and mark it `rescheduled`. The original time and every
+    change are kept in `reschedule_history`, the attendance window is recomputed
+    (dropping per-participant overrides) and attendees are notified."""
     return await session_service.reschedule_session(db, session, data, user)
 
 
@@ -114,5 +128,24 @@ async def set_session_resources(
     db: DbSession,
 ) -> ProgrammeSession:
     """Replace the session's material links (slides, recordings, Drive folders).
-    Allowed for staff and the session's mentors."""
+    Allowed for those who manage the session and for its mentors."""
     return await session_service.replace_resources(db, session, data.resources, user)
+
+
+@router.get("/{session_id}/notes/me", response_model=SessionNoteResponse)
+async def get_my_notes(
+    session: VisibleSession, user: ParticipantUser, db: DbSession
+) -> SessionNote:
+    """The caller's personal notes for a session, visible only to them."""
+    return await session_service.get_note(db, user, session)
+
+
+@router.put("/{session_id}/notes/me", response_model=SessionNoteResponse)
+async def save_my_notes(
+    data: SessionNoteRequest,
+    session: VisibleSession,
+    user: ParticipantUser,
+    db: DbSession,
+) -> SessionNote:
+    """Save or replace the caller's personal notes for a session."""
+    return await session_service.save_note(db, user, session, data.body)

@@ -8,7 +8,6 @@ from sqlalchemy import select
 
 from forge.core.config import settings
 from forge.models import (
-    ActivityStatus,
     ActivityType,
     AttendanceRecord,
     AttendanceStatus,
@@ -16,12 +15,17 @@ from forge.models import (
     ExtraActivity,
     MentorRole,
     Notification,
+    Objective,
+    ObjectiveType,
     SessionMentor,
+    SessionType,
 )
 from forge.services import notifications as notification_service
 from tests.conftest import Factory, Programme, token_for
 
 PAST = datetime.now(UTC) - timedelta(days=10)
+HIGH = [5, 4, 4, 4, 4, 4, 4, 4, 4]
+LOW = [3] * 9
 
 
 async def seed(db_session, factory: Factory, programme: Programme):
@@ -35,7 +39,7 @@ async def seed(db_session, factory: Factory, programme: Programme):
         programme.cohort,
         starts_at=PAST,
         track="web",
-        session_type="ict",
+        session_type=SessionType.HANDS_ON,
         title="Web 101",
     )
     upcoming = await factory.session(
@@ -54,18 +58,20 @@ async def seed(db_session, factory: Factory, programme: Programme):
             AttendanceRecord(
                 mentee_id=m0.id,
                 session_id=session.id,
-                status=AttendanceStatus.ATTENDED,
-                quality_rating=5,
-                usefulness_rating=4,
+                status=AttendanceStatus.PRESENT,
+                ratings=HIGH,
                 feedback="Loved it",
+                submitted_at=session.starts_at,
             )
         )
     db_session.add(
         AttendanceRecord(
             mentee_id=m1.id,
             session_id=core[0].id,
-            status=AttendanceStatus.ATTENDED,
-            quality_rating=3,
+            status=AttendanceStatus.PRESENT,
+            ratings=LOW,
+            feedback="Too fast",
+            submitted_at=core[0].starts_at,
         )
     )
     db_session.add(
@@ -75,8 +81,21 @@ async def seed(db_session, factory: Factory, programme: Programme):
             cohort_id=programme.cohort.id,
             title="Course",
             date=date.today(),
-            status=ActivityStatus.PENDING,
-            details={"course_name": "OS"},
+            points_awarded=4,
+            details={
+                "kami_limu_pillar": "ICT",
+                "related_session_ids": [str(core[0].id)],
+                "how_applied": "Group project",
+            },
+        )
+    )
+    db_session.add(
+        Objective(
+            user_id=m1.id,
+            cohort_id=programme.cohort.id,
+            type=ObjectiveType.TECHNICAL,
+            text="Ship a side project",
+            ratings=[],
         )
     )
     await db_session.commit()
@@ -109,13 +128,34 @@ async def test_mentee_dashboard(
     )
 
     assert overview["points"]["core_points_earned"] == 30
-    assert overview["graduation"]["status"] == "on_track"
+    assert overview["points"]["sessions_remaining"] == 1
+    assert (overview["core_rate"], overview["overall_rate"]) == (100.0, 100.0)
+    assert "graduation" not in overview
     assert overview["next_session"]["id"] == str(upcoming.id)
-    assert len(history) == 3
+    assert len(history) == 4
     assert [m["key"] for m in monthly] == ["1", "2"]
     assert {t["key"] for t in by_track} == {"core", "web"}
     assert activities.status_code == 200
     assert as_committee.status_code == 403
+
+
+async def test_peer_mentor_sees_own_participation_dashboard(
+    client: AsyncClient, db_session, factory: Factory, programme: Programme
+):
+    await seed(db_session, factory, programme)
+
+    response = await client.get(
+        "/api/v1/dashboard/mentee/overview", headers=token_for(programme.peer_mentor)
+    )
+    month = await client.get(
+        "/api/v1/dashboard/mentee/attendance/history",
+        params={"kami_limu_month": 2},
+        headers=token_for(programme.mentees[0]),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["points"]["sessions_missed"] == 2
+    assert {s["kami_limu_month"] for s in month.json()} == {2}
 
 
 async def test_peer_mentor_dashboard(
@@ -128,9 +168,6 @@ async def test_peer_mentor_dashboard(
     group = (
         await client.get("/api/v1/dashboard/peer-mentor/group", headers=headers)
     ).json()
-    at_risk = (
-        await client.get("/api/v1/dashboard/peer-mentor/at-risk", headers=headers)
-    ).json()
     drill = await client.get(
         f"/api/v1/dashboard/peer-mentor/mentees/{m1.id}", headers=headers
     )
@@ -139,10 +176,13 @@ async def test_peer_mentor_dashboard(
     )
 
     assert [m["mentee"]["id"] for m in group["mentees"]] == [str(m1.id), str(m0.id)]
-    assert group["at_risk"] == 1
-    assert [m["mentee"]["id"] for m in at_risk] == [str(m1.id)]
-    assert drill.status_code == 200
-    assert drill.json()["recent_activities"][0]["type"] == "academic"
+    assert "at_risk" not in group and "status" not in group["mentees"][0]
+    assert group["mentees"][0]["overall_rate"] > group["mentees"][0]["core_rate"]
+    body = drill.json()
+    assert body["recent_activities"][0]["type"] == "academic"
+    assert body["objectives"][0]["text"] == "Ship a side project"
+    assert body["session_feedback"][0]["ratings"] == LOW
+    assert body["session_feedback"][0]["feedback"] == "Too fast"
     assert outside.status_code == 404
 
 
@@ -176,10 +216,13 @@ async def test_ict_and_professional_mentor_dashboards(
     ]
     assert track["mentees"][0]["track"]["rate"] == 100.0
     assert [s["session"]["id"] for s in ict_sessions] == [str(web.id)]
-    assert ict_sessions[0]["eligible"] == 1
+    # The mentee on the web track and the track's ICT peer mentor.
+    assert ict_sessions[0]["eligible"] == 2
     assert prof[0]["session"]["id"] == str(core[0].id)
     assert prof[0]["attended"] == 2
     assert prof[0]["average_quality"] == 4.0
+    assert len(prof[0]["question_averages"]) == 9
+    assert prof[0]["question_averages"][1]["average"] == 3.5
 
 
 async def test_session_feedback_is_anonymous(
@@ -189,12 +232,20 @@ async def test_session_feedback_is_anonymous(
     url = f"/api/v1/sessions/{core[0].id}/feedback"
 
     feedback = (await client.get(url, headers=token_for(programme.prof_mentor))).json()
+    staff = (await client.get(url, headers=token_for(programme.committee))).json()
     denied = await client.get(url, headers=token_for(programme.mentees[0]))
 
     assert feedback["responses"] == 2
-    assert feedback["averages"]["quality_rating"] == 4.0
-    assert all(e["respondent"].startswith("Mentee-") for e in feedback["entries"])
+    assert feedback["anonymous"] is True
+    assert [q["average"] for q in feedback["questions"]][:2] == [4.0, 3.5]
+    assert feedback["questions"][6]["group"] == "intended_behaviour"
+    assert all(e["respondent"].startswith("Participant-") for e in feedback["entries"])
     assert str(programme.mentees[0].id) not in str(feedback)
+    assert staff["anonymous"] is False
+    assert {e["mentee_id"] for e in staff["entries"]} == {
+        str(programme.mentees[0].id),
+        str(programme.mentees[1].id),
+    }
     assert denied.status_code == 403
 
 
@@ -210,15 +261,13 @@ async def test_committee_dashboard(
             "/api/v1/dashboard/committee/cohort-health", params=params, headers=headers
         )
     ).json()
-    queue = (
-        await client.get(
-            "/api/v1/dashboard/committee/activities-queue",
-            params=params,
-            headers=headers,
-        )
-    ).json()
     overrides = await client.get(
-        "/api/v1/dashboard/committee/override-queue", params=params, headers=headers
+        "/api/v1/dashboard/admin/override-queue",
+        params=params,
+        headers=token_for(programme.admin),
+    )
+    committee_queue = await client.get(
+        "/api/v1/dashboard/admin/override-queue", params=params, headers=headers
     )
     trends = await client.get(
         "/api/v1/dashboard/committee/analytics/attendance-trends",
@@ -242,10 +291,11 @@ async def test_committee_dashboard(
     )
 
     assert health["total_mentees"] == 3
-    assert health["pending_activities"] == 1
-    assert health["counts"]["on_track"] == 1
-    assert queue["total"] == 1
+    assert "counts" not in health and "pending_activities" not in health
+    assert health["points_distributed"] == 30 + 14
+    assert health["sessions_scheduled"] == 4
     assert overrides.json()["total"] == 0
+    assert committee_queue.status_code == 403
     assert trends.status_code == quality.status_code == tracks.status_code == 200
     assert denied.status_code == 403
 
@@ -265,10 +315,14 @@ async def test_analytics_endpoints(
 
     assert [(m["month"], m["sessions"]) for m in trends["months"]] == [(1, 2), (2, 1)]
     assert {t["track"] for t in tracks["tracks"]} == {"core", "web"}
-    assert quality["overall_quality"] == 4.5
+    assert quality["questions"][0]["average"] == 4.5
+    assert quality["sessions"][0]["responses"] == 2
     assert [p["month"] for p in trajectory["months"]] == [1, 2]
+    month_two = trajectory["months"][1]
+    assert (month_two["meeting_threshold"], month_two["below_threshold"]) == (1, 2)
+    assert {t["type"] for t in engagement["types"]} >= {"scholarship"}
     academic = next(t for t in engagement["types"] if t["type"] == "academic")
-    assert academic["counts"]["pending"] == 1 and academic["mentees_participating"] == 1
+    assert academic["counts"]["active"] == 1 and academic["mentees_participating"] == 1
 
 
 async def test_snapshots_and_cross_cohort(
@@ -279,6 +333,7 @@ async def test_snapshots_and_cross_cohort(
     headers = token_for(programme.admin)
     base = f"/api/v1/analytics/cohorts/{programme.cohort.id}/snapshots"
 
+    by_committee = await client.post(base, headers=token_for(programme.committee))
     first = await client.post(base, headers=headers)
     second = await client.post(base, headers=headers)
     listing = (await client.get(base, headers=headers)).json()
@@ -299,6 +354,7 @@ async def test_snapshots_and_cross_cohort(
         headers=token_for(programme.committee),
     )
 
+    assert by_committee.status_code == 403
     assert first.status_code == second.status_code == 201
     assert len(listing) == 1
     assert listing[0]["metrics"]["health"]["total_mentees"] == 3
@@ -318,19 +374,27 @@ async def test_csv_exports(
     leaderboard = await client.post(
         f"/api/v1/exports/leaderboard/{cid}", headers=headers
     )
+    peer_board = await client.post(
+        f"/api/v1/exports/leaderboard/{cid}",
+        params={"board": "peer_mentor"},
+        headers=headers,
+    )
     denied = await client.post(
         f"/api/v1/exports/attendance/{cid}", headers=token_for(programme.mentees[0])
     )
 
     attendance_lines = attendance.text.strip().splitlines()
     assert attendance_lines[0].startswith("email,mentee,session")
+    assert attendance_lines[0].endswith("q8,q9")
     assert (
         len(attendance_lines) == 1 + 2 * 3 + 1
     )  # core sessions for 3 mentees + web for its 1 mentee
     report_lines = report.text.strip().splitlines()
     assert len(report_lines) == 4
     assert "Peer User" in report.text
+    assert "overall_rate" in report_lines[0]
     assert leaderboard.status_code == 200
+    assert peer_board.text.startswith("rank,peer_mentor,sessions_attended")
     assert denied.status_code == 403
 
 

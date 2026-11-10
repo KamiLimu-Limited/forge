@@ -12,21 +12,15 @@ from forge.db.base import Base, CreatedAtMixin, UUIDPrimaryKeyMixin, pg_enum
 
 
 class NotificationType(enum.StrEnum):
-    SESSION_PUBLISHED = "session_published"
+    INVITATION = "invitation"
+    PASSWORD_RESET = "password_reset"
+    WINDOW_OPENS = "attendance_window_opens"
+    WINDOW_CLOSING_SOON = "attendance_window_closing_soon"
     SESSION_RESCHEDULED = "session_rescheduled"
     SESSION_CANCELLED = "session_cancelled"
-    WINDOW_OPENING = "attendance_window_opening"
-    WINDOW_CLOSING_SOON = "attendance_window_closing_soon"
-    GRADUATION_WARNING = "graduation_warning"
-    GRADUATION_AT_RISK = "graduation_at_risk"
     OVERRIDE_SUBMITTED = "override_request_submitted"
     OVERRIDE_APPROVED = "override_request_approved"
     OVERRIDE_DENIED = "override_request_denied"
-    ACTIVITY_APPROVED = "extra_activity_approved"
-    ACTIVITY_REJECTED = "extra_activity_rejected"
-    TASK_LAUNCHED = "peer_task_launched"
-    TASK_DEADLINE_REMINDER = "peer_task_deadline_reminder"
-    COHORT_INVITATION = "cohort_onboarding_invitation"
     BROADCAST = "broadcast"
 
 

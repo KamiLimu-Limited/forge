@@ -11,20 +11,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from forge.core.config import settings
 from forge.core.exceptions import BusinessRuleViolation, NotFound, PermissionDenied
 from forge.models import (
+    PEER_MENTOR_ROLES,
+    AttendanceRecord,
+    AttendanceWindow,
     Cohort,
     CohortEnrollment,
     NotificationType,
     ProgrammeSession,
     SessionMentor,
+    SessionNote,
     SessionResource,
     SessionStatus,
-    SessionType,
     User,
-    UserRole,
     UserRoleAssignment,
 )
 from forge.schemas.session import (
     CalendarMonth,
+    InProgressSession,
     MentorAssignment,
     ResourceIn,
     SessionCreateRequest,
@@ -32,18 +35,33 @@ from forge.schemas.session import (
     SessionRescheduleRequest,
     SessionResponse,
     SessionUpdateRequest,
+    check_times,
 )
 from forge.services.access import (
-    ensure_cohort_staff,
+    can_manage_session,
+    ensure_can_manage_session,
+    ensure_cohort_writable,
     get_cohort_or_404,
+    get_participant_enrollment,
     is_cohort_staff,
 )
 from forge.services.audit import log_action
 from forge.services.cohorts import month_for
-from forge.services.eligibility import eligible_mentee_ids
+from forge.services.eligibility import (
+    COUNTED_STATUSES,
+    applies_to_enrollment,
+    eligible_mentee_ids,
+)
 from forge.services.notifications import cohort_member_ids, notify
 from forge.services.pagination import paginate
-from forge.services.windows import get_window, sync_window
+from forge.services.windows import effective_closes_at, get_window, sync_window
+
+# Sessions whose attendance window has been opened.
+SCHEDULED_STATUSES = (
+    SessionStatus.PUBLISHED,
+    SessionStatus.LIVE,
+    SessionStatus.RESCHEDULED,
+)
 
 
 async def get_session_or_404(
@@ -84,10 +102,19 @@ async def get_visible_session(
     return session
 
 
+async def _managed_cohort(
+    db: AsyncSession, actor: User, session: ProgrammeSession
+) -> Cohort:
+    ensure_can_manage_session(actor, session.cohort_id, session.category)
+    cohort = await get_cohort_or_404(db, session.cohort_id)
+    ensure_cohort_writable(cohort)
+    return cohort
+
+
 async def _validate(
     db: AsyncSession, cohort: Cohort, track: str | None, mentors: list[MentorAssignment]
 ) -> None:
-    if track and cohort.ict_tracks_offered and track not in cohort.ict_tracks_offered:
+    if track and track not in cohort.ict_track_names:
         raise BusinessRuleViolation(f"Track '{track}' is not offered in this cohort")
     for mentor in mentors:
         if await db.get(User, mentor.user_id) is None:
@@ -120,9 +147,7 @@ async def _announce(
 ) -> None:
     recipients = await eligible_mentee_ids(db, session)
     recipients += [m.user_id for m in session.mentors]
-    recipients += await cohort_member_ids(
-        db, session.cohort_id, [UserRole.PEER_MENTOR_1_1, UserRole.PEER_MENTOR_ICT]
-    )
+    recipients += await cohort_member_ids(db, session.cohort_id, PEER_MENTOR_ROLES)
     notify(
         db,
         recipients,
@@ -147,8 +172,9 @@ async def _announce(
 async def create_session(
     db: AsyncSession, data: SessionCreateRequest, actor: User
 ) -> ProgrammeSession:
+    ensure_can_manage_session(actor, data.cohort_id, data.category)
     cohort = await get_cohort_or_404(db, data.cohort_id)
-    ensure_cohort_staff(actor, cohort.id)
+    ensure_cohort_writable(cohort)
     await _validate(db, cohort, data.track, data.mentors)
 
     values = data.model_dump(exclude={"mentors", "resources"})
@@ -168,7 +194,6 @@ async def create_session(
     await db.flush()
     if session.status is SessionStatus.PUBLISHED:
         await sync_window(db, session, cohort)
-        await _announce(db, session, NotificationType.SESSION_PUBLISHED)
     log_action(
         db,
         "create_session",
@@ -219,34 +244,38 @@ async def list_sessions(
 async def update_session(
     db: AsyncSession, session: ProgrammeSession, data: SessionUpdateRequest, actor: User
 ) -> ProgrammeSession:
-    ensure_cohort_staff(actor, session.cohort_id)
-    cohort = await get_cohort_or_404(db, session.cohort_id)
+    cohort = await _managed_cohort(db, actor, session)
     if session.status is SessionStatus.CANCELLED:
         raise BusinessRuleViolation("Cancelled sessions cannot be edited")
 
     values = data.model_dump(exclude_unset=True)
     new_status = values.pop("status", None)
-    if new_status in (SessionStatus.DRAFT, SessionStatus.CANCELLED):
+    if new_status not in (None, SessionStatus.PUBLISHED, SessionStatus.COMPLETED):
         raise BusinessRuleViolation(
-            "Sessions cannot be moved back to draft; use DELETE to cancel"
+            "Sessions can only be published or completed here; use DELETE to "
+            "cancel and /reschedule to move them"
         )
+    if new_status is SessionStatus.PUBLISHED and session.status is not (
+        SessionStatus.DRAFT
+    ):
+        raise BusinessRuleViolation("Only draft sessions can be published")
+    if "category" in values:
+        ensure_can_manage_session(actor, session.cohort_id, values["category"])
     await _validate(db, cohort, values.get("track", session.track), [])
     for key, value in values.items():
         setattr(session, key, value)
-    if session.session_type is SessionType.ICT and not session.track:
-        raise BusinessRuleViolation("ICT sessions require a track")
+    try:
+        check_times(session.starts_at, session.ends_at, session.category)
+    except ValueError as e:
+        raise BusinessRuleViolation(str(e)) from e
 
-    publishing = (
-        new_status is SessionStatus.PUBLISHED and session.status is SessionStatus.DRAFT
-    )
+    publishing = new_status is SessionStatus.PUBLISHED
     if new_status is not None:
         session.status = new_status
-    if session.status in (SessionStatus.PUBLISHED, SessionStatus.COMPLETED) and (
-        publishing or {"category", "attendance_deadline"} & values.keys()
+    if session.status is not SessionStatus.DRAFT and (
+        publishing or "category" in values
     ):
         await sync_window(db, session, cohort)
-    if publishing:
-        await _announce(db, session, NotificationType.SESSION_PUBLISHED)
 
     log_action(
         db,
@@ -268,12 +297,16 @@ async def reschedule_session(
     actor: User,
 ) -> ProgrammeSession:
     """Move a session, keeping its original time and history, and reset its window."""
-    ensure_cohort_staff(actor, session.cohort_id)
+    cohort = await _managed_cohort(db, actor, session)
     if session.status in (SessionStatus.CANCELLED, SessionStatus.COMPLETED):
         raise BusinessRuleViolation(
             f"Cannot reschedule a {session.status.value} session"
         )
-    cohort = await get_cohort_or_404(db, session.cohort_id)
+    ends_at = data.ends_at or data.starts_at + (session.ends_at - session.starts_at)
+    try:
+        check_times(data.starts_at, ends_at, session.category)
+    except ValueError as e:
+        raise BusinessRuleViolation(str(e)) from e
 
     entry: dict[str, Any] = {
         "from": session.starts_at.isoformat(),
@@ -285,12 +318,11 @@ async def reschedule_session(
     previous = (session.starts_at, session.ends_at)
     session.original_starts_at = session.original_starts_at or session.starts_at
     session.reschedule_history = [*(session.reschedule_history or []), entry]
-    session.starts_at = data.starts_at
-    if data.duration_minutes:
-        session.duration_minutes = data.duration_minutes
+    session.starts_at, session.ends_at = data.starts_at, ends_at
     session.kami_limu_month = month_for(cohort, data.starts_at.date())
 
-    if session.status is SessionStatus.PUBLISHED:
+    if session.status is not SessionStatus.DRAFT:
+        session.status = SessionStatus.RESCHEDULED
         await sync_window(db, session, cohort, reset_overrides=True)
         await _announce(
             db, session, NotificationType.SESSION_RESCHEDULED, data.reason, previous
@@ -311,10 +343,10 @@ async def reschedule_session(
 async def cancel_session(
     db: AsyncSession, session: ProgrammeSession, actor: User, reason: str | None
 ) -> None:
-    ensure_cohort_staff(actor, session.cohort_id)
+    await _managed_cohort(db, actor, session)
     if session.status is SessionStatus.CANCELLED:
         return
-    was_published = session.status is SessionStatus.PUBLISHED
+    was_published = session.status is not SessionStatus.DRAFT
     session.status = SessionStatus.CANCELLED
     if window := await get_window(db, session.id):
         window.is_active = False
@@ -338,8 +370,7 @@ async def replace_mentors(
     mentors: list[MentorAssignment],
     actor: User,
 ) -> ProgrammeSession:
-    ensure_cohort_staff(actor, session.cohort_id)
-    cohort = await get_cohort_or_404(db, session.cohort_id)
+    cohort = await _managed_cohort(db, actor, session)
     await _validate(db, cohort, None, mentors)
     session.mentors.clear()
     await db.flush()
@@ -355,12 +386,13 @@ async def replace_resources(
     resources: list[ResourceIn],
     actor: User,
 ) -> ProgrammeSession:
-    """Staff and the session's own mentors may manage its material links."""
+    """Session managers and the session's own mentors may manage its material links."""
     if not (
-        is_cohort_staff(actor, session.cohort_id) or is_session_mentor(actor, session)
+        can_manage_session(actor, session.cohort_id, session.category)
+        or is_session_mentor(actor, session)
     ):
         raise PermissionDenied(
-            "Only staff or this session's mentors can update resources"
+            "Only session managers or this session's mentors can update resources"
         )
     session.resources = _resources(resources)
     log_action(
@@ -398,3 +430,108 @@ async def cohort_calendar(
         CalendarMonth(month=m, name=names.get(m), sessions=s)
         for m, s in sorted(by_month.items())
     ]
+
+
+async def in_progress(db: AsyncSession, user: User) -> list[InProgressSession]:
+    """Sessions whose window is open for the caller, including tasks before their
+    deadline and windows reopened for them, soonest closing first."""
+    now = datetime.now(UTC)
+    rows = await db.execute(
+        select(ProgrammeSession, AttendanceWindow)
+        .join(AttendanceWindow, AttendanceWindow.session_id == ProgrammeSession.id)
+        .join(CohortEnrollment, applies_to_enrollment())
+        .where(
+            CohortEnrollment.user_id == user.id,
+            ProgrammeSession.status.in_(COUNTED_STATUSES),
+            AttendanceWindow.opens_at <= now,
+        )
+    )
+    submitted = set(
+        await db.scalars(
+            select(AttendanceRecord.session_id).where(
+                AttendanceRecord.mentee_id == user.id,
+                AttendanceRecord.submitted_at.is_not(None),
+            )
+        )
+    )
+    items = [
+        InProgressSession(
+            session=SessionResponse.model_validate(session),
+            closes_at=closes_at,
+            submitted=session.id in submitted,
+        )
+        for session, window in rows.unique()
+        if (closes_at := effective_closes_at(window, user.id)) > now
+    ]
+    return sorted(items, key=lambda i: i.closes_at)
+
+
+async def ensure_participant(
+    db: AsyncSession, user: User, session: ProgrammeSession
+) -> None:
+    if await get_participant_enrollment(db, user.id, session.cohort_id) is None:
+        raise PermissionDenied("Only the session's participants keep notes on it")
+
+
+async def get_note(
+    db: AsyncSession, user: User, session: ProgrammeSession
+) -> SessionNote:
+    await ensure_participant(db, user, session)
+    note = await db.scalar(
+        select(SessionNote).where(
+            SessionNote.user_id == user.id, SessionNote.session_id == session.id
+        )
+    )
+    if note is None:
+        raise NotFound("No notes for this session yet")
+    return note
+
+
+async def save_note(
+    db: AsyncSession, user: User, session: ProgrammeSession, body: str
+) -> SessionNote:
+    await ensure_participant(db, user, session)
+    note = await db.scalar(
+        select(SessionNote).where(
+            SessionNote.user_id == user.id, SessionNote.session_id == session.id
+        )
+    )
+    if note is None:
+        note = SessionNote(user_id=user.id, session_id=session.id, body=body)
+        db.add(note)
+    else:
+        note.body = body
+    await db.commit()
+    await db.refresh(note)
+    return note
+
+
+async def advance_statuses(db: AsyncSession) -> int:
+    """Mark sessions live while their window is open and completed once it has
+    closed; participants are told when a window opens."""
+    now = datetime.now(UTC)
+    rows = await db.execute(
+        select(ProgrammeSession, AttendanceWindow)
+        .join(AttendanceWindow, AttendanceWindow.session_id == ProgrammeSession.id)
+        .where(ProgrammeSession.status.in_(SCHEDULED_STATUSES))
+    )
+    changed = 0
+    for session, window in rows:
+        closed = not window.is_active or window.closes_at <= now
+        if closed:
+            session.status = SessionStatus.COMPLETED
+        elif window.opens_at <= now and session.status is not SessionStatus.LIVE:
+            session.status = SessionStatus.LIVE
+            notify(
+                db,
+                await eligible_mentee_ids(db, session),
+                NotificationType.WINDOW_OPENS,
+                {"title": session.title, "closes_at": window.closes_at},
+                resource_type="session",
+                resource_id=session.id,
+            )
+        else:
+            continue
+        changed += 1
+    await db.commit()
+    return changed

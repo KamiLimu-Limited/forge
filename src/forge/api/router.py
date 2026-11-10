@@ -8,15 +8,19 @@ from forge.api.routes import (
     attendance,
     audit,
     auth,
+    cohort_config,
     cohorts,
-    competitions,
+    consultants,
     dashboards,
     extra_activities,
+    facilitator,
+    graduation,
+    ict_tracks,
+    leaderboard,
     mentees,
     notifications,
-    peer_mentorship,
+    objectives,
     sessions,
-    skills,
     users,
 )
 from forge.schemas.common import ErrorResponse
@@ -36,19 +40,26 @@ api_router = APIRouter(
     }
 )
 
+# Competitions and mentor notes (routes.competitions, routes.mentor_notes) are
+# Phase 2 features and stay unmounted until then.
 for router in (
     auth.router,
     users.router,
+    users.alumni_router,
     admin.router,
     audit.router,
     cohorts.router,
+    cohort_config.router,
+    ict_tracks.router,
+    graduation.router,
     sessions.router,
     attendance.router,
     mentees.router,
+    objectives.router,
     extra_activities.router,
-    peer_mentorship.router,
-    skills.router,
-    competitions.router,
+    consultants.router,
+    leaderboard.router,
+    facilitator.router,
     dashboards.router,
     dashboards.feedback_router,
     notifications.router,

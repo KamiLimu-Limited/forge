@@ -18,9 +18,8 @@ from forge.services import (
     analytics,
     attendance,
     auth,
-    mentorship,
     notifications,
-    points,
+    sessions,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,9 +32,8 @@ ADVISORY_LOCK_ID = 0x464F524745  # "FORGE"
 def default_jobs() -> list[Job]:
     return [
         attendance.close_expired_windows,
+        sessions.advance_statuses,
         notifications.send_window_closing_reminders,
-        mentorship.send_task_deadline_reminders,
-        points.send_graduation_warnings,
         notifications.dispatch_pending_emails,
         auth.purge_expired_tokens,
         analytics.snapshot_active_cohorts,

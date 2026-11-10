@@ -1,15 +1,31 @@
 """SQLAlchemy models."""
 
-from forge.models.activity import ActivityStatus, ActivityType, ExtraActivity
+from forge.models.activity import (
+    APPLICATION_TYPES,
+    ActivityStatus,
+    ActivityType,
+    Consultant,
+    ExtraActivity,
+)
 from forge.models.attendance import (
+    RATING_QUESTION_COUNT,
     AttendanceRecord,
+    AttendanceSource,
     AttendanceStatus,
     AttendanceWindow,
     AttendanceWindowOverride,
     OverrideRequest,
     OverrideRequestStatus,
+    SessionNote,
 )
-from forge.models.cohort import Cohort, CohortEnrollment, CohortStatus, ProgrammeType
+from forge.models.cohort import (
+    READ_ONLY_STATUSES,
+    Cohort,
+    CohortEnrollment,
+    CohortIctTrack,
+    CohortStatus,
+    ProgrammeType,
+)
 from forge.models.competition import (
     Competition,
     CompetitionEntry,
@@ -18,20 +34,25 @@ from forge.models.competition import (
     CompetitionType,
     EntryStatus,
 )
-from forge.models.mentorship import (
-    IctProgressNote,
-    PeerMentorNote,
-    PeerMentorTask,
-    RatingPoint,
-    SkillRating,
-    SubmissionStatus,
-    TaskSubmission,
+from forge.models.graduation import (
+    CohortGraduation,
+    GraduationCorrection,
+    GraduationResult,
+    LeaderboardKind,
+    LeaderboardSnapshot,
 )
+from forge.models.mentorship import IctProgressNote, PeerMentorNote
 from forge.models.notification import (
     CohortAnalyticsSnapshot,
     EmailStatus,
     Notification,
     NotificationType,
+)
+from forge.models.objective import (
+    Objective,
+    ObjectiveRating,
+    ObjectiveType,
+    RatingPoint,
 )
 from forge.models.programme_session import (
     MentorRole,
@@ -45,8 +66,12 @@ from forge.models.programme_session import (
     SessionType,
 )
 from forge.models.user import (
+    PARTICIPANT_ROLES,
+    PEER_MENTOR_ROLES,
     AccountState,
     AuditLog,
+    DegreeLevel,
+    Gender,
     Invitation,
     PasswordResetToken,
     TokenBlacklist,
@@ -56,10 +81,12 @@ from forge.models.user import (
 )
 
 __all__ = [
+    "APPLICATION_TYPES",
     "AccountState",
     "ActivityStatus",
     "ActivityType",
     "AttendanceRecord",
+    "AttendanceSource",
     "AttendanceStatus",
     "AttendanceWindow",
     "AttendanceWindowOverride",
@@ -67,38 +94,51 @@ __all__ = [
     "Cohort",
     "CohortAnalyticsSnapshot",
     "CohortEnrollment",
+    "CohortGraduation",
+    "CohortIctTrack",
     "CohortStatus",
     "Competition",
     "CompetitionEntry",
     "CompetitionRound",
     "CompetitionStatus",
     "CompetitionType",
+    "Consultant",
+    "DegreeLevel",
     "EmailStatus",
     "EntryStatus",
     "ExtraActivity",
+    "Gender",
+    "GraduationCorrection",
+    "GraduationResult",
     "IctProgressNote",
     "Invitation",
+    "LeaderboardKind",
+    "LeaderboardSnapshot",
     "MentorRole",
     "Notification",
     "NotificationType",
+    "Objective",
+    "ObjectiveRating",
+    "ObjectiveType",
     "OverrideRequest",
     "OverrideRequestStatus",
+    "PARTICIPANT_ROLES",
+    "PEER_MENTOR_ROLES",
     "PasswordResetToken",
     "PeerMentorNote",
-    "PeerMentorTask",
     "ProgrammeSession",
     "ProgrammeType",
+    "RATING_QUESTION_COUNT",
+    "READ_ONLY_STATUSES",
     "RatingPoint",
     "ResourceType",
     "SessionCategory",
     "SessionMentor",
     "SessionMode",
+    "SessionNote",
     "SessionResource",
     "SessionStatus",
     "SessionType",
-    "SkillRating",
-    "SubmissionStatus",
-    "TaskSubmission",
     "TokenBlacklist",
     "User",
     "UserRole",

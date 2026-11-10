@@ -1,7 +1,7 @@
 """Cohort and enrollment management."""
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from forge.core.config import settings
 from forge.core.exceptions import BusinessRuleViolation, Conflict, NotFound
 from forge.models import (
+    READ_ONLY_STATUSES,
     Cohort,
     CohortEnrollment,
     CohortStatus,
@@ -33,7 +34,9 @@ from forge.services.pagination import paginate
 
 
 def can_see_drafts(user: User) -> bool:
-    return user.is_admin or UserRole.COMMITTEE in user.role_set
+    return user.is_admin or bool(
+        {UserRole.PROGRAM_LEAD, UserRole.COMMITTEE} & user.role_set
+    )
 
 
 def _column_values(
@@ -42,7 +45,7 @@ def _column_values(
     values = data.model_dump(exclude_unset=exclude_unset)
     # JSONB columns need JSON-safe values (dates and datetimes as ISO strings).
     as_json = data.model_dump(mode="json", exclude_unset=exclude_unset)
-    for field in ("kami_limu_month_boundaries", "skill_rating_windows"):
+    for field in ("kami_limu_month_boundaries", "objective_windows"):
         if field in values:
             values[field] = as_json[field]
     return values
@@ -51,9 +54,9 @@ def _column_values(
 async def create_cohort(
     db: AsyncSession, data: CohortCreateRequest, actor: User
 ) -> Cohort:
-    values = _column_values(data, exclude_unset=False)
-    values["skill_names"] = data.skill_names or settings.DEFAULT_SKILL_NAMES
-    values["leaderboard_anonymous"] = bool(data.leaderboard_anonymous)
+    if data.status in READ_ONLY_STATUSES:
+        raise BusinessRuleViolation("A new cohort must be draft or active")
+    values = _column_values(data, exclude_unset=True)
     cohort = Cohort(**values)
     db.add(cohort)
     try:
@@ -74,11 +77,7 @@ async def create_cohort(
 async def list_cohorts(
     db: AsyncSession, user: User, filters: CohortFilters
 ) -> tuple[list[Cohort], int]:
-    stmt = (
-        select(Cohort)
-        .where(Cohort.deleted_at.is_(None))
-        .order_by(Cohort.start_date.desc())
-    )
+    stmt = select(Cohort).order_by(Cohort.start_date.desc())
     if not can_see_drafts(user):
         stmt = stmt.where(Cohort.status != CohortStatus.DRAFT)
     if filters.status:
@@ -113,6 +112,10 @@ async def enrollment_counts(
 async def update_cohort(
     db: AsyncSession, cohort: Cohort, data: CohortUpdateRequest, actor: User
 ) -> Cohort:
+    if data.status in READ_ONLY_STATUSES:
+        raise BusinessRuleViolation(
+            "Cohorts are completed by graduation and archived through /archive"
+        )
     values = _column_values(data, exclude_unset=True)
     for key, value in values.items():
         setattr(cohort, key, value)
@@ -135,18 +138,6 @@ async def update_cohort(
     return cohort
 
 
-async def soft_delete_cohort(db: AsyncSession, cohort: Cohort, actor: User) -> None:
-    cohort.deleted_at = datetime.now(UTC)
-    log_action(
-        db,
-        "delete_cohort",
-        user_id=actor.id,
-        resource_type="cohort",
-        resource_id=cohort.id,
-    )
-    await db.commit()
-
-
 def month_for(cohort: Cohort, when: date) -> int:
     """KamiLimu month for a date: configured boundaries first, else calendar months since start."""
     for boundary in cohort.kami_limu_month_boundaries or []:
@@ -162,29 +153,30 @@ def month_for(cohort: Cohort, when: date) -> int:
     return max(months, 0) + 1
 
 
-async def _validate_enrollment(
-    db: AsyncSession, cohort: Cohort, data: EnrollmentRequest | EnrollmentUpdateRequest
+async def _validate_peer_mentor(
+    db: AsyncSession, cohort: Cohort, peer_mentor_id: uuid.UUID | None
 ) -> None:
-    if (
-        data.ict_track
-        and cohort.ict_tracks_offered
-        and data.ict_track not in cohort.ict_tracks_offered
-    ):
+    if peer_mentor_id is None:
+        return
+    assignable_from = cohort.start_date + timedelta(
+        days=settings.PEER_MENTOR_ASSIGNMENT_DELAY_DAYS
+    )
+    if date.today() < assignable_from:
         raise BusinessRuleViolation(
-            f"ICT track '{data.ict_track}' is not offered in this cohort"
+            f"1:1 peer mentors can be assigned from {assignable_from.isoformat()}"
         )
-    if data.peer_mentor_id:
-        mentor = await db.scalar(
-            select(CohortEnrollment.id).where(
-                CohortEnrollment.cohort_id == cohort.id,
-                CohortEnrollment.user_id == data.peer_mentor_id,
-                CohortEnrollment.role == UserRole.PEER_MENTOR_1_1,
-            )
+    mentor = await db.scalar(
+        select(CohortEnrollment.id).where(
+            CohortEnrollment.cohort_id == cohort.id,
+            CohortEnrollment.user_id == peer_mentor_id,
+            CohortEnrollment.role == UserRole.PEER_MENTOR_1_1,
+            CohortEnrollment.archived_at.is_(None),
         )
-        if mentor is None:
-            raise BusinessRuleViolation(
-                "peer_mentor_id must be a 1:1 peer mentor enrolled in this cohort"
-            )
+    )
+    if mentor is None:
+        raise BusinessRuleViolation(
+            "peer_mentor_id must be a 1:1 peer mentor enrolled in this cohort"
+        )
 
 
 async def ensure_role_assignment(
@@ -220,7 +212,6 @@ async def add_enrollment(
     """Stage an enrollment (and its cohort-scoped role); caller commits."""
     if await db.get(User, data.user_id) is None:
         raise NotFound("User not found")
-    await _validate_enrollment(db, cohort, data)
     duplicate = await db.scalar(
         select(CohortEnrollment.id).where(
             CohortEnrollment.cohort_id == cohort.id,
@@ -235,8 +226,6 @@ async def add_enrollment(
         cohort_id=cohort.id,
         user_id=data.user_id,
         role=data.role,
-        peer_mentor_id=data.peer_mentor_id,
-        ict_track=data.ict_track,
         enrolled_by=actor_id,
     )
     db.add(enrollment)
@@ -334,17 +323,19 @@ async def update_enrollment(
     data: EnrollmentUpdateRequest,
     actor: User,
 ) -> CohortEnrollment:
-    await _validate_enrollment(db, cohort, data)
-    values = data.model_dump(exclude_unset=True)
-    for key, value in values.items():
-        setattr(enrollment, key, value)
+    if enrollment.role is not UserRole.MENTEE:
+        raise BusinessRuleViolation("Only mentees are assigned a 1:1 peer mentor")
+    await _validate_peer_mentor(db, cohort, data.peer_mentor_id)
+    previous = enrollment.peer_mentor_id
+    enrollment.peer_mentor_id = data.peer_mentor_id
     log_action(
         db,
-        "update_enrollment",
+        "assign_peer_mentor",
         user_id=actor.id,
         resource_type="cohort_enrollment",
         resource_id=enrollment.id,
-        fields=sorted(values),
+        old=str(previous) if previous else None,
+        new=str(data.peer_mentor_id) if data.peer_mentor_id else None,
     )
     await db.commit()
     await db.refresh(enrollment)

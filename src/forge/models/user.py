@@ -2,7 +2,7 @@
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import ForeignKey, Index, String, func
@@ -25,13 +25,33 @@ class AccountState(enum.StrEnum):
 
 class UserRole(enum.StrEnum):
     MENTEE = "mentee"
-    PEER_MENTOR_1_1 = "peer_mentor_1:1"
+    PEER_MENTOR_1_1 = "peer_mentor_1_1"
     PEER_MENTOR_ICT = "peer_mentor_ict"
     PROFESSIONAL_MENTOR = "professional_mentor"
     COMMITTEE = "committee"
-    PARTNER = "partner"
+    PROGRAM_DELIVERY_LEAD = "program_delivery_lead"
+    PROGRAM_LEAD = "program_lead"
     ALUMNI = "alumni"
     ADMIN = "admin"
+
+
+PEER_MENTOR_ROLES = (UserRole.PEER_MENTOR_1_1, UserRole.PEER_MENTOR_ICT)
+# Roles that attend sessions, submit attendance and earn points.
+PARTICIPANT_ROLES = (UserRole.MENTEE, *PEER_MENTOR_ROLES)
+
+
+class DegreeLevel(enum.StrEnum):
+    DIPLOMA = "diploma"
+    BACHELORS = "bachelors"
+    MASTERS = "masters"
+    DOCTORATE = "doctorate"
+
+
+class Gender(enum.StrEnum):
+    FEMALE = "female"
+    MALE = "male"
+    NON_BINARY = "non_binary"
+    PREFER_NOT_TO_SAY = "prefer_not_to_say"
 
 
 class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -45,6 +65,20 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         pg_enum(AccountState), default=AccountState.PENDING
     )
     last_login_at: Mapped[datetime | None]
+
+    university: Mapped[str | None] = mapped_column(String(200))
+    programme_of_study: Mapped[str | None] = mapped_column(String(200))
+    degree_level: Mapped[DegreeLevel | None] = mapped_column(pg_enum(DegreeLevel))
+    gender: Mapped[Gender | None] = mapped_column(pg_enum(Gender))
+    phone: Mapped[str | None] = mapped_column(String(30))
+    birthday: Mapped[date | None]
+    # {"linkedin": url, "github": url, "instagram": url, ...}
+    social_links: Mapped[dict[str, Any] | None]
+    alumni_since: Mapped[date | None]
+    active_cohort_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("cohorts.id", ondelete="SET NULL")
+    )
+    active_role: Mapped[UserRole | None] = mapped_column(pg_enum(UserRole))
 
     roles: Mapped[list["UserRoleAssignment"]] = relationship(
         back_populates="user",
@@ -71,6 +105,10 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     @property
     def is_admin(self) -> bool:
         return UserRole.ADMIN in self.role_set
+
+    @property
+    def is_alumni(self) -> bool:
+        return self.alumni_since is not None
 
     def __repr__(self) -> str:
         return f"<User {self.email}>"
@@ -111,6 +149,8 @@ class Invitation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     intended_cohort_id: Mapped[uuid.UUID | None]
     first_name: Mapped[str | None] = mapped_column(String(100))
     last_name: Mapped[str | None] = mapped_column(String(100))
+    # Profile fields copied onto the user when the invitation is accepted.
+    profile: Mapped[dict[str, Any] | None]
     revoked_at: Mapped[datetime | None]
 
     @property

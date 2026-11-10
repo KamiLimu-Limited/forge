@@ -13,41 +13,37 @@ from forge.models import (
     AttendanceRecord,
     AttendanceStatus,
     AttendanceWindow,
-    Cohort,
     CohortEnrollment,
-    CohortStatus,
     ExtraActivity,
     OverrideRequest,
     OverrideRequestStatus,
-    PeerMentorNote,
-    PeerMentorTask,
     ProgrammeSession,
     SessionMentor,
     SessionStatus,
-    SubmissionStatus,
-    TaskSubmission,
     User,
     UserRole,
 )
-from forge.schemas.activity import activity_adapter
+from forge.schemas.activity import ExtraActivityResponse
 from forge.schemas.attendance import SessionBrief
 from forge.schemas.dashboard import (
     FeedbackEntry,
     GroupOverview,
     MenteeDrilldown,
     MenteeOverview,
+    MenteeSessionFeedback,
     MenteeSummary,
     SessionAttendanceSummary,
     SessionFeedbackResponse,
-    TaskCompletion,
     TrackMenteeSummary,
     TrackOverview,
 )
-from forge.schemas.points import GraduationStatus
+from forge.schemas.objective import ObjectiveResponse
 from forge.schemas.user import UserSummary
+from forge.services import ratings
 from forge.services.access import get_cohort_or_404, get_enrollment, is_cohort_staff
 from forge.services.eligibility import COUNTED_STATUSES, applies_to_enrollment
 from forge.services.notifications import unread_count
+from forge.services.objectives import list_objectives
 from forge.services.points import (
     MenteeStats,
     breakdown,
@@ -56,34 +52,27 @@ from forge.services.points import (
     graduation,
     rates,
 )
-from forge.services.sessions import is_session_mentor
+from forge.services.sessions import SCHEDULED_STATUSES, is_session_mentor
 from forge.services.windows import is_open
 
-RATING_FIELDS = ("quality_rating", "usefulness_rating", "understanding_score")
 
-
-def summarize(
-    enrollment: CohortEnrollment, stats: MenteeStats, cohort: Cohort
-) -> MenteeSummary:
+def summarize(enrollment: CohortEnrollment, stats: MenteeStats) -> MenteeSummary:
     return MenteeSummary(
         mentee=UserSummary.model_validate(enrollment.user),
         ict_track=enrollment.ict_track,
         total_points=stats.total_points,
         core_rate=stats.core_rate,
-        combined_rate=stats.combined_rate,
-        status=stats.graduation_status(
-            cohort.graduation_threshold, cohort.status is CohortStatus.COMPLETED
-        ),
+        overall_rate=stats.overall_rate,
         sessions_attended=stats.total.attended,
         sessions_due=stats.total.due,
     )
 
 
 async def mentee_overview(
-    db: AsyncSession, mentee: User, enrollment: CohortEnrollment
+    db: AsyncSession, user: User, enrollment: CohortEnrollment
 ) -> MenteeOverview:
     cohort = await get_cohort_or_404(db, enrollment.cohort_id)
-    stats = (await compute_stats(db, cohort.id, [mentee.id]))[mentee.id]
+    stats = (await compute_stats(db, cohort.id, [user.id]))[user.id]
     now = datetime.now(UTC)
 
     upcoming = await db.scalars(
@@ -91,7 +80,7 @@ async def mentee_overview(
         .join(CohortEnrollment, applies_to_enrollment())
         .where(
             CohortEnrollment.id == enrollment.id,
-            ProgrammeSession.status == SessionStatus.PUBLISHED,
+            ProgrammeSession.status.in_(SCHEDULED_STATUSES),
             ProgrammeSession.starts_at > now,
         )
         .order_by(ProgrammeSession.starts_at)
@@ -106,7 +95,7 @@ async def mentee_overview(
             ProgrammeSession.status.in_(COUNTED_STATUSES),
             ~AttendanceWindow.session_id.in_(
                 select(AttendanceRecord.session_id).where(
-                    AttendanceRecord.mentee_id == mentee.id,
+                    AttendanceRecord.mentee_id == user.id,
                     AttendanceRecord.status != AttendanceStatus.MISSED,
                 )
             ),
@@ -114,7 +103,7 @@ async def mentee_overview(
     )
     pending_overrides = await db.scalar(
         select(func.count()).where(
-            OverrideRequest.mentee_id == mentee.id,
+            OverrideRequest.mentee_id == user.id,
             OverrideRequest.status == OverrideRequestStatus.PENDING,
         )
     )
@@ -122,13 +111,15 @@ async def mentee_overview(
     return MenteeOverview(
         cohort_id=cohort.id,
         points=breakdown(stats),
-        graduation=graduation(stats, cohort),
+        core_rate=stats.core_rate,
+        overall_rate=stats.overall_rate,
+        graduation_threshold=cohort.graduation_threshold,
         next_session=SessionBrief.model_validate(next_session)
         if next_session
         else None,
-        open_attendance_windows=sum(is_open(w, mentee.id, now) for w in windows),
+        open_attendance_windows=sum(is_open(w, user.id, now) for w in windows),
         pending_override_requests=pending_overrides or 0,
-        unread_notifications=await unread_count(db, mentee),
+        unread_notifications=await unread_count(db, user),
     )
 
 
@@ -165,17 +156,17 @@ async def group_overview(
     group = await _group(db, mentor.id, cohort.id)
     stats = await compute_stats(db, cohort.id, [e.user_id for e in group])
     summaries = sorted(
-        (summarize(e, stats[e.user_id], cohort) for e in group),
-        key=lambda s: s.combined_rate,
+        (summarize(e, stats[e.user_id]) for e in group), key=lambda s: s.core_rate
     )
+
+    def average(values: list[float]) -> float:
+        return round(fmean(values), 2) if values else 0.0
+
     return GroupOverview(
         cohort_id=cohort.id,
         mentees=summaries,
-        average_combined_rate=round(fmean(s.combined_rate for s in summaries), 2)
-        if summaries
-        else 0.0,
-        at_risk=sum(s.status is GraduationStatus.AT_RISK for s in summaries),
-        warning=sum(s.status is GraduationStatus.WARNING for s in summaries),
+        average_core_rate=average([s.core_rate for s in summaries]),
+        average_overall_rate=average([s.overall_rate for s in summaries]),
     )
 
 
@@ -197,39 +188,35 @@ async def mentee_drilldown(
         .order_by(ExtraActivity.created_at.desc())
         .limit(5)
     )
-    notes = await db.scalar(
-        select(func.count()).where(
-            PeerMentorNote.peer_mentor_id == mentor.id,
-            PeerMentorNote.mentee_id == mentee_id,
-        )
-    )
-    tasks = await db.scalar(
-        select(func.count()).where(
-            PeerMentorTask.peer_mentor_id == mentor.id,
-            PeerMentorTask.cohort_id == cohort.id,
-        )
-    )
-    completed = await db.scalar(
-        select(func.count())
-        .select_from(TaskSubmission)
-        .join(PeerMentorTask, PeerMentorTask.id == TaskSubmission.task_id)
+    submissions = await db.scalars(
+        select(AttendanceRecord)
+        .join(ProgrammeSession, ProgrammeSession.id == AttendanceRecord.session_id)
         .where(
-            PeerMentorTask.peer_mentor_id == mentor.id,
-            TaskSubmission.mentee_id == mentee_id,
-            TaskSubmission.submission_status == SubmissionStatus.COMPLETED,
+            AttendanceRecord.mentee_id == mentee_id,
+            ProgrammeSession.cohort_id == cohort.id,
+            AttendanceRecord.submitted_at.is_not(None),
         )
+        .order_by(ProgrammeSession.starts_at.desc())
     )
     return MenteeDrilldown(
-        summary=summarize(enrollment, stats, cohort),
+        summary=summarize(enrollment, stats),
         points=await detailed_breakdown(db, stats),
         rates=rates(stats),
         graduation=graduation(stats, cohort),
-        recent_activities=[
-            activity_adapter.validate_python(a, from_attributes=True)
-            for a in activities
+        objectives=[
+            ObjectiveResponse.model_validate(o)
+            for o in await list_objectives(db, mentee_id, cohort.id)
         ],
-        notes=notes or 0,
-        tasks=TaskCompletion(completed=completed or 0, total=tasks or 0),
+        session_feedback=[
+            MenteeSessionFeedback(
+                session=SessionBrief.model_validate(r.session),
+                ratings=r.ratings,
+                feedback=r.feedback,
+                submitted_at=r.submitted_at,
+            )
+            for r in submissions
+        ],
+        recent_activities=[ExtraActivityResponse.model_validate(a) for a in activities],
     )
 
 
@@ -262,7 +249,6 @@ async def track_overview(
         )
     )
     stats = await compute_stats(db, cohort.id, [e.user_id for e in mentees])
-    final = cohort.status is CohortStatus.COMPLETED
     return TrackOverview(
         cohort_id=cohort.id,
         track=own.ict_track,
@@ -270,10 +256,8 @@ async def track_overview(
             TrackMenteeSummary(
                 mentee=UserSummary.model_validate(e.user),
                 track=stats[e.user_id].by_track[own.ict_track].bucket(own.ict_track),
-                combined_rate=stats[e.user_id].combined_rate,
-                status=stats[e.user_id].graduation_status(
-                    cohort.graduation_threshold, final
-                ),
+                core_rate=stats[e.user_id].core_rate,
+                overall_rate=stats[e.user_id].overall_rate,
             )
             for e in mentees
         ],
@@ -296,31 +280,33 @@ async def _session_summaries(
             )
         ).all()
     )
-    attendance = {
-        sid: (attended, responses, avg)
-        for sid, attended, responses, avg in await db.execute(
-            select(
-                AttendanceRecord.session_id,
-                func.count().filter(
-                    AttendanceRecord.status == AttendanceStatus.ATTENDED
-                ),
-                func.count(AttendanceRecord.quality_rating),
-                func.avg(AttendanceRecord.quality_rating),
+    attended = dict(
+        (
+            await db.execute(
+                select(AttendanceRecord.session_id, func.count())
+                .where(
+                    AttendanceRecord.session_id.in_(ids),
+                    AttendanceRecord.status == AttendanceStatus.PRESENT,
+                )
+                .group_by(AttendanceRecord.session_id)
             )
-            .where(AttendanceRecord.session_id.in_(ids))
-            .group_by(AttendanceRecord.session_id)
-        )
-    }
+        ).all()
+    )
+    averages = await ratings.averages_by_session(db, ids)
+    cohorts = {s.cohort_id: await get_cohort_or_404(db, s.cohort_id) for s in sessions}
     result = []
     for s in sessions:
-        attended, responses, avg = attendance.get(s.id, (0, 0, None))
+        responses, values = averages.get(
+            s.id, (0, [None] * len(ratings.QUESTION_NUMBERS))
+        )
         result.append(
             SessionAttendanceSummary(
                 session=SessionBrief.model_validate(s),
                 eligible=eligible.get(s.id, 0),
-                attended=attended,
+                attended=attended.get(s.id, 0),
                 responses=responses,
-                average_quality=round(float(avg), 2) if avg is not None else None,
+                average_quality=values[0],
+                question_averages=ratings.describe(values, cohorts[s.cohort_id]),
             )
         )
     return result
@@ -357,40 +343,47 @@ async def professional_mentor_sessions(
 def anonymous_id(session_id: uuid.UUID, mentee_id: uuid.UUID) -> str:
     """Stable per-session pseudonym, so responses can't be linked across sessions."""
     digest = hashlib.sha256(f"{session_id}:{mentee_id}".encode()).hexdigest()[:8]
-    return f"Mentee-{digest}"
+    return f"Participant-{digest}"
 
 
 async def session_feedback(
     db: AsyncSession, user: User, session: ProgrammeSession
 ) -> SessionFeedbackResponse:
-    if not (
-        is_cohort_staff(user, session.cohort_id) or is_session_mentor(user, session)
-    ):
+    """Staff see who responded; the session's mentors see anonymous respondents."""
+    staff = is_cohort_staff(user, session.cohort_id)
+    if not (staff or is_session_mentor(user, session)):
         raise PermissionDenied(
             "Only staff and this session's mentors can view its feedback"
         )
     records = list(
         await db.scalars(
             select(AttendanceRecord).where(
-                AttendanceRecord.session_id == session.id,
-                AttendanceRecord.status == AttendanceStatus.ATTENDED,
+                AttendanceRecord.session_id == session.id, ratings.rated()
             )
         )
     )
-    averages: dict[str, float | None] = {}
-    for f in RATING_FIELDS:
-        values = [v for r in records if (v := getattr(r, f)) is not None]
-        averages[f] = round(fmean(values), 2) if values else None
+    names: dict[uuid.UUID, str] = {}
+    if staff and records:
+        names = {
+            u.id: u.full_name
+            for u in await db.scalars(
+                select(User).where(User.id.in_([r.mentee_id for r in records]))
+            )
+        }
+    _, values = await ratings.averages(db, AttendanceRecord.session_id == session.id)
+    cohort = await get_cohort_or_404(db, session.cohort_id)
     return SessionFeedbackResponse(
         session_id=session.id,
         responses=len(records),
-        averages=averages,
+        anonymous=not staff,
+        questions=ratings.describe(values, cohort),
         entries=[
             FeedbackEntry(
-                respondent=anonymous_id(session.id, r.mentee_id),
-                quality_rating=r.quality_rating,
-                usefulness_rating=r.usefulness_rating,
-                understanding_score=r.understanding_score,
+                respondent=names[r.mentee_id]
+                if staff
+                else anonymous_id(session.id, r.mentee_id),
+                mentee_id=r.mentee_id if staff else None,
+                ratings=r.ratings,
                 feedback=r.feedback,
             )
             for r in records

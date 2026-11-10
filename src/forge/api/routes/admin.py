@@ -4,6 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.api.deps import AdminUser, ClientIP, DbSession, RequireRoles
 from forge.api.routes.auth import queue_invitation_emails
@@ -40,23 +41,33 @@ TargetUser = Annotated[User, Depends(target_user)]
 async def list_users(
     filters: Annotated[UserFilters, Query()], db: DbSession
 ) -> Page[AdminUserListResponse]:
-    """List users, filterable by account state, role, cohort and a name/email search."""
+    """List users with their profile fields, filterable by account state, role,
+    cohort and a name/email search."""
     users, total = await user_service.list_users(db, filters)
     return Page[AdminUserListResponse].build(users, total, filters)
 
 
-@router.get("/users/{user_id}", response_model=AdminUserDetailResponse)
-async def get_user(user: TargetUser) -> User:
-    """A user's account details and role assignments."""
-    return user
+async def _detail(db: AsyncSession, user: User) -> AdminUserDetailResponse:
+    return AdminUserDetailResponse.model_validate(user).model_copy(
+        update={"ict_track": await user_service.ict_track(db, user)}
+    )
 
 
-@router.patch("/users/{user_id}", response_model=AdminUserDetailResponse)
+@router.get("/users/{user_id}")
+async def get_user(user: TargetUser, db: DbSession) -> AdminUserDetailResponse:
+    """A user's account details, profile and role assignments."""
+    return await _detail(db, user)
+
+
+@router.patch("/users/{user_id}")
 async def update_user(
     data: AdminUserUpdateRequest, user: TargetUser, admin: AdminUser, db: DbSession
-) -> User:
-    """Update a user's name or email. Changes are recorded in the audit log."""
-    return await user_service.admin_update_user(db, user, data, admin)
+) -> AdminUserDetailResponse:
+    """Update a user's name, email or profile fields. Changes are recorded in the
+    audit log. ICT tracks change through track selection."""
+    return await _detail(
+        db, await user_service.admin_update_user(db, user, data, admin)
+    )
 
 
 @router.post("/users/{user_id}/suspend")

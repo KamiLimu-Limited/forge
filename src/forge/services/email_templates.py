@@ -34,21 +34,15 @@ ADMIN_REASON = "Reason from the System Admin"
 # Mentee and peer mentor screens don't exist in the frontend yet, so their emails
 # land on the dashboard until they do.
 PATHS: dict[NotificationType, str] = {
-    T.SESSION_PUBLISHED: "/dashboard",
+    T.INVITATION: "/dashboard",
+    T.PASSWORD_RESET: "/dashboard",
     T.SESSION_RESCHEDULED: "/dashboard",
     T.SESSION_CANCELLED: "/dashboard",
-    T.WINDOW_OPENING: "/dashboard",
+    T.WINDOW_OPENS: "/dashboard",
     T.WINDOW_CLOSING_SOON: "/dashboard",
-    T.GRADUATION_WARNING: "/dashboard",
-    T.GRADUATION_AT_RISK: "/dashboard",
     T.OVERRIDE_SUBMITTED: "/admin/attendance-queue",
     T.OVERRIDE_APPROVED: "/dashboard",
     T.OVERRIDE_DENIED: "/dashboard",
-    T.ACTIVITY_APPROVED: "/dashboard",
-    T.ACTIVITY_REJECTED: "/dashboard",
-    T.TASK_LAUNCHED: "/dashboard",
-    T.TASK_DEADLINE_REMINDER: "/dashboard",
-    T.COHORT_INVITATION: "/dashboard",
     T.BROADCAST: "/dashboard",
 }
 FALLBACK_PATH = "/dashboard"
@@ -80,7 +74,7 @@ SESSION = Row("Session", "$title")
 WHEN = Row("When", "$when")
 
 SPECS: dict[NotificationType, EmailSpec] = {
-    T.WINDOW_OPENING: EmailSpec(
+    T.WINDOW_OPENS: EmailSpec(
         subject="Attendance is open: $title",
         heading="Attendance is open",
         paragraphs=("You can now record your attendance for this session.",),
@@ -166,90 +160,21 @@ SPECS: dict[NotificationType, EmailSpec] = {
         quote=(ADMIN_REASON, "reason"),
         button="View your sessions",
     ),
-    T.SESSION_PUBLISHED: EmailSpec(
-        subject="New session: $title",
-        heading="A new session is on your calendar",
-        paragraphs=("A new session has been scheduled for your cohort.",),
-        details=(SESSION, WHEN, Row("Where", "$location")),
-        button="View session",
-    ),
-    T.GRADUATION_WARNING: EmailSpec(
-        subject="Your attendance is close to the graduation threshold",
-        heading="Your attendance is close to the threshold",
-        paragraphs=(
-            "Your attendance is $rate%, close to the $threshold% needed to graduate.",
-        ),
-        details=(
-            Row("Cohort", "$cohort"),
-            Row("Your attendance", "$rate%"),
-            Row("Required", "$threshold%"),
-        ),
-        paragraphs_after=(
-            "Attending and recording the sessions ahead will keep you on track.",
-        ),
-        button="View your progress",
-    ),
-    T.GRADUATION_AT_RISK: EmailSpec(
-        subject="Your attendance is below the graduation threshold",
-        heading="Your attendance is below the threshold",
-        paragraphs=(
-            "Your attendance is $rate%, below the $threshold% needed to graduate.",
-        ),
-        details=(
-            Row("Cohort", "$cohort"),
-            Row("Your attendance", "$rate%"),
-            Row("Required", "$threshold%"),
-        ),
-        paragraphs_after=(
-            "There's still time to close the gap by attending and recording the "
-            "sessions ahead. If something is getting in the way, talk to your peer "
-            "mentor.",
-        ),
-        button="View your progress",
-    ),
-    T.ACTIVITY_APPROVED: EmailSpec(
-        subject="Activity approved: $title",
-        heading="Your activity was approved",
-        paragraphs=(
-            "Your $type activity was approved and the points added to your total.",
-        ),
-        details=(Row("Activity", "$title"), Row("Points", "$points")),
-        button="View your progress",
-    ),
-    T.ACTIVITY_REJECTED: EmailSpec(
-        subject="Activity not approved: $title",
-        heading="Your activity wasn't approved",
-        paragraphs=(
-            "Your $type activity was reviewed and wasn't approved, so it won't add "
-            "points.",
-        ),
-        details=(Row("Activity", "$title"),),
-        quote=(ADMIN_REASON, "reason"),
-        button="View your activities",
-    ),
-    T.TASK_LAUNCHED: EmailSpec(
-        subject="New task: $title",
-        heading="Your peer mentor set a new task",
-        paragraphs=("Your peer mentor launched a new task for your group.",),
-        details=(Row("Task", "$title"), Row("Due", "$deadline")),
-        button="View task",
-    ),
-    T.TASK_DEADLINE_REMINDER: EmailSpec(
-        subject="Task due soon: $title",
-        heading="A task is due soon",
-        paragraphs=("You haven't marked this task complete yet.",),
-        details=(Row("Task", "$title"), Row("Due", "$deadline")),
-        paragraphs_after=("Mark it complete once you're done.",),
-        button="View task",
-    ),
-    T.COHORT_INVITATION: EmailSpec(
+    T.INVITATION: EmailSpec(
         subject="Welcome to $cohort",
         heading="Welcome to $cohort",
         paragraphs=(
-            "You've been added to $cohort. Your upcoming sessions are on your "
-            "dashboard.",
+            "You've been invited to $cohort. Activate your account to see your "
+            "upcoming sessions.",
         ),
         button="Open your dashboard",
+    ),
+    T.PASSWORD_RESET: EmailSpec(
+        subject="Reset your password",
+        heading="Reset your password",
+        paragraphs=("A password reset was requested for your account.",),
+        notes=("If you didn't ask for this, you can ignore this email.",),
+        button="Open KamiLimu",
     ),
     T.BROADCAST: EmailSpec(
         subject="$title",

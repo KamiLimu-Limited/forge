@@ -33,7 +33,8 @@ leaderboards, notifications and analytics.
 
 1. An admin invites a user (`POST /auth/invite`, `/auth/bulk-invite` or `/auth/bulk-invite/csv`).
 2. The user activates their account with the emailed token (`POST /auth/activate`).
-3. `POST /auth/login` returns an access token (1h) and a refresh token (7d).
+3. `POST /auth/login` returns an access token (1h) and a refresh token (30 to 90
+   days, set by `REFRESH_TOKEN_EXPIRE_DAYS`).
 4. Send `Authorization: Bearer <access_token>` on every request
    (use the **Authorize** button above).
 5. `POST /auth/refresh` rotates the pair; `POST /auth/logout` revokes it.
@@ -45,13 +46,14 @@ leaderboards, notifications and analytics.
   return `{items, total, page, page_size, total_pages}`.
 * **Rate limiting**: login, activation and reset requests are limited per client IP;
   over the limit you get `429`.
-* **Access control**: users see their own records, peer mentors their group,
-  committee members their cohort, and admins everything.
+* **Access control**: users see their own records, peer mentors their group and
+  committee members read their cohort. System Admins and Program Leads manage
+  cohorts; the Program Delivery Lead runs peer mentorship sessions.
 
 ## Roles
 
-`admin`, `committee`, `mentee`, `peer_mentor_1:1`, `peer_mentor_ict`,
-`professional_mentor`, `partner`, `alumni`.
+`admin`, `program_lead`, `committee`, `program_delivery_lead`, `mentee`,
+`peer_mentor_1_1`, `peer_mentor_ict`, `professional_mentor`, `alumni`.
 """
 
 TAGS_METADATA = [
@@ -59,7 +61,10 @@ TAGS_METADATA = [
         "name": "Authentication",
         "description": "Invitations (single, bulk JSON, CSV upload), activation, login, token refresh, logout and password reset.",
     },
-    {"name": "Users", "description": "The authenticated user's own profile."},
+    {
+        "name": "Users",
+        "description": "Your profile, cohorts and active cohort context, graduation card and alumni history.",
+    },
     {
         "name": "Admin",
         "description": "User, role, invitation and audit-log administration. **Admin only.**",
@@ -70,36 +75,52 @@ TAGS_METADATA = [
         "description": "Cohorts, enrollments, calendars and the graduation report.",
     },
     {
+        "name": "Cohort Configuration",
+        "description": "Per-cohort extra-activity points and the nine session rating questions.",
+    },
+    {
+        "name": "ICT Tracks",
+        "description": "ICT tracks offered with their lead mentors, and mentees' track selection.",
+    },
+    {
+        "name": "Graduation",
+        "description": "Graduation preview and confirmation, the graduation sequence, corrections, and closing and archiving a cohort.",
+    },
+    {
         "name": "Sessions",
         "description": "Session scheduling, publishing, rescheduling, cancellation, mentors and resources.",
     },
     {
         "name": "Attendance",
-        "description": "Attendance submission within windows, override requests and committee/peer-mentor views.",
+        "description": "Attendance and the nine ratings within windows, window extension requests, and staff and peer-mentor views.",
     },
     {
         "name": "Mentee Progress",
-        "description": "Points, attendance rates, graduation status, skill progress and competition status for a mentee.",
+        "description": "Points, core and overall attendance rates, graduation status and objectives for a mentee.",
+    },
+    {
+        "name": "Objectives",
+        "description": "Human and Technical objectives rated at Start, Mid and End.",
     },
     {
         "name": "Extra Activities",
-        "description": "Academic work, external events, opportunities and consultations, with committee validation.",
+        "description": "Academic work, external events, job and scholarship applications and consultations, with points on submission and reversal.",
     },
     {
-        "name": "Peer Mentorship",
-        "description": "Private peer-mentor notes, ICT progress notes and group tasks.",
+        "name": "Consultants",
+        "description": "The consultant roster for consultation logs.",
     },
     {
-        "name": "Skills",
-        "description": "Early, mid and late-programme skill self-ratings.",
+        "name": "Leaderboard",
+        "description": "Mentee and peer mentor leaderboards, and saved snapshots.",
     },
     {
-        "name": "Leaderboard & Competitions",
-        "description": "Six-dimension leaderboard, competitions, rounds and entries.",
+        "name": "Facilitator Ratings",
+        "description": "How peer mentors are rated on the sessions they facilitate.",
     },
     {
         "name": "Dashboards",
-        "description": "Pre-aggregated data for mentee, peer mentor, ICT mentor, professional mentor and committee dashboards.",
+        "description": "Pre-aggregated data for mentee, peer mentor, ICT mentor, professional mentor, committee, System Admin and Program Lead dashboards.",
     },
     {
         "name": "Notifications",

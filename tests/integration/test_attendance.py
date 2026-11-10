@@ -12,13 +12,16 @@ from tests.conftest import Factory, Programme, token_for
 PAST = datetime.now(UTC) - timedelta(days=5)
 
 
+RATINGS = [5, 4, 4, 5, 3, 4, 5, 4, 5]
+
+
 async def submit(client, mentee, session, **extra):
     return await client.post(
         "/api/v1/attendance",
         json={
             "session_id": str(session.id),
-            "quality_rating": 5,
-            "usefulness_rating": 4,
+            "status": "present",
+            "ratings": RATINGS,
             "feedback": "Great",
         }
         | extra,
@@ -32,15 +35,44 @@ async def test_submit_within_window(
     session = await factory.session(programme.cohort)
     mentee = programme.mentees[0]
 
-    response = await submit(
-        client, mentee, session, personal_notes="remember git rebase"
-    )
+    response = await submit(client, mentee, session)
     duplicate = await submit(client, mentee, session)
 
     assert response.status_code == 201, response.text
-    assert response.json()["status"] == "attended"
-    assert response.json()["personal_notes"] == "remember git rebase"
+    body = response.json()
+    assert (body["status"], body["source"]) == ("present", "on_time")
+    assert body["ratings"] == RATINGS
     assert duplicate.status_code == 409
+
+
+async def test_present_requires_nine_ratings_and_feedback(
+    client: AsyncClient, programme: Programme, factory: Factory
+):
+    session = await factory.session(programme.cohort)
+    mentee = programme.mentees[0]
+
+    eight = await submit(client, mentee, session, ratings=RATINGS[:8])
+    no_feedback = await submit(client, mentee, session, feedback=None)
+    out_of_range = await submit(client, mentee, session, ratings=[6] * 9)
+    absent = await submit(client, mentee, session, status="absent", ratings=None)
+
+    assert eight.status_code == 422
+    assert no_feedback.status_code == 422
+    assert out_of_range.status_code == 422
+    assert absent.status_code == 201
+    assert absent.json()["ratings"] is None
+
+
+async def test_peer_mentors_submit_attendance(
+    client: AsyncClient, programme: Programme, factory: Factory
+):
+    session = await factory.session(programme.cohort)
+
+    peer = await submit(client, programme.peer_mentor, session)
+    committee = await submit(client, programme.committee, session)
+
+    assert peer.status_code == 201
+    assert committee.status_code == 403
 
 
 async def test_submit_rejected_when_window_closed(
@@ -78,14 +110,12 @@ async def test_track_session_only_for_track_mentees(
     assert outsider.status_code == 403
 
 
-async def test_not_attended_cannot_carry_ratings(
+async def test_absent_cannot_carry_ratings(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     session = await factory.session(programme.cohort)
 
-    response = await submit(
-        client, programme.mentees[0], session, status="not_attended"
-    )
+    response = await submit(client, programme.mentees[0], session, status="absent")
 
     assert response.status_code == 422
 
@@ -95,19 +125,26 @@ async def test_update_and_visibility(
 ):
     session = await factory.session(programme.cohort)
     mentee = programme.mentees[0]
-    record = (await submit(client, mentee, session, personal_notes="private")).json()
+    record = (await submit(client, mentee, session)).json()
     url = f"/api/v1/attendance/{record['id']}"
 
     updated = await client.patch(
-        url, json={"quality_rating": 3}, headers=token_for(mentee)
+        url, json={"ratings": [3] * 9}, headers=token_for(mentee)
+    )
+    to_absent = await client.patch(
+        url, json={"status": "absent"}, headers=token_for(mentee)
+    )
+    back_without_ratings = await client.patch(
+        url, json={"status": "present"}, headers=token_for(mentee)
     )
     as_mentor = await client.get(url, headers=token_for(programme.peer_mentor))
     as_committee = await client.get(url, headers=token_for(programme.committee))
     as_peer = await client.get(url, headers=token_for(programme.mentees[1]))
 
-    assert updated.json()["quality_rating"] == 3
+    assert updated.json()["ratings"] == [3] * 9
+    assert to_absent.json()["ratings"] is None
+    assert back_without_ratings.status_code == 422
     assert as_mentor.status_code == 200
-    assert "personal_notes" not in as_mentor.json()
     assert as_committee.status_code == 200
     assert as_peer.status_code == 404
 
@@ -177,9 +214,14 @@ async def test_override_request_workflow(
     session = await factory.session(programme.cohort, starts_at=PAST)
     mentee = programme.mentees[0]
 
+    deadline = datetime.now(UTC) + timedelta(days=2)
     request = await client.post(
         "/api/v1/attendance/override-requests",
-        json={"session_id": str(session.id), "reason": "I was in hospital"},
+        json={
+            "session_id": str(session.id),
+            "reason": "I was in hospital",
+            "requested_closes_at": deadline.isoformat(),
+        },
         headers=token_for(mentee),
     )
     assert request.status_code == 201, request.text
@@ -192,23 +234,29 @@ async def test_override_request_workflow(
     )
     assert queue.json()["total"] == 1
 
-    by_mentee = await client.patch(
-        f"/api/v1/attendance/override-requests/{request_id}/approve",
-        json={},
-        headers=token_for(mentee),
+    queue = await client.get(
+        "/api/v1/dashboard/admin/override-queue", headers=token_for(programme.admin)
     )
+    assert queue.json()["total"] == 1
+
+    for user in (mentee, programme.committee):
+        denied = await client.patch(
+            f"/api/v1/attendance/override-requests/{request_id}/approve",
+            json={},
+            headers=token_for(user),
+        )
+        assert denied.status_code == 403
     approved = await client.patch(
         f"/api/v1/attendance/override-requests/{request_id}/approve",
         json={"reason": "Medical note received"},
-        headers=token_for(programme.committee),
+        headers=token_for(programme.program_lead),
     )
     again = await client.patch(
         f"/api/v1/attendance/override-requests/{request_id}/deny",
         json={},
-        headers=token_for(programme.committee),
+        headers=token_for(programme.admin),
     )
 
-    assert by_mentee.status_code == 403
     assert approved.json()["status"] == "approved"
     assert again.status_code == 422
 
@@ -219,7 +267,10 @@ async def test_override_request_workflow(
         )
     ).json()
     assert window["is_open"] is True and window["has_override"] is True
-    assert (await submit(client, mentee, session)).status_code == 201
+    assert datetime.fromisoformat(window["effective_closes_at"]) == deadline
+    late = await submit(client, mentee, session)
+    assert late.status_code == 201
+    assert late.json()["source"] == "reopened"
 
 
 async def test_override_rejected_while_window_open(
@@ -236,27 +287,30 @@ async def test_override_rejected_while_window_open(
     assert response.status_code == 422
 
 
-async def test_committee_can_excuse(
+async def test_manager_can_excuse_but_committee_cannot(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     session = await factory.session(programme.cohort)
     record = (
         await submit(
-            client,
-            programme.mentees[0],
-            session,
-            status="not_attended",
-            quality_rating=None,
-            usefulness_rating=None,
+            client, programme.mentees[0], session, status="absent", ratings=None
         )
     ).json()
+    url = f"/api/v1/attendance/{record['id']}/status"
+    body = {"status": "excused", "reason": "Exam"}
 
+    by_committee = await client.patch(
+        url, json=body, headers=token_for(programme.committee)
+    )
+    disputed = await client.patch(
+        url, json={"status": "disputed"}, headers=token_for(programme.program_lead)
+    )
     response = await client.patch(
-        f"/api/v1/attendance/{record['id']}/status",
-        json={"status": "excused", "reason": "Exam"},
-        headers=token_for(programme.committee),
+        url, json=body, headers=token_for(programme.program_lead)
     )
 
+    assert by_committee.status_code == 403
+    assert disputed.status_code == 422
     assert response.json()["status"] == "excused"
 
 
@@ -280,6 +334,7 @@ async def test_close_expired_windows_marks_missed(
             )
         )
     )
-    assert created == 3
+    # Three mentees and both peer mentors.
+    assert created == 5
     assert again == 0
-    assert statuses == [AttendanceStatus.MISSED] * 3
+    assert statuses == [AttendanceStatus.MISSED] * 5

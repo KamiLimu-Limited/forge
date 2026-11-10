@@ -124,21 +124,21 @@ def test_rescheduled_shows_old_time_struck():
 def test_empty_values_hide_rows_and_quote():
     content = build(NotificationType.SESSION_CANCELLED, {**SAMPLE_META, "reason": ""})
     assert "Reason from the System Admin" not in content.html
-    published = build(
-        NotificationType.SESSION_PUBLISHED, {**SAMPLE_META, "location": ""}
+    submitted = build(
+        NotificationType.OVERRIDE_SUBMITTED, {**SAMPLE_META, "submitted_at": ""}
     )
-    assert ">Where<" not in published.html
+    assert ">Submitted<" not in submitted.html
 
 
 def test_unparseable_date_falls_back_to_raw_value():
     content = build(
-        NotificationType.WINDOW_OPENING, {**SAMPLE_META, "closes_at": "soon-ish"}
+        NotificationType.WINDOW_OPENS, {**SAMPLE_META, "closes_at": "soon-ish"}
     )
     assert "soon-ish" in content.html
 
 
 def test_dates_use_nairobi_time():
-    content = build(NotificationType.WINDOW_OPENING)
+    content = build(NotificationType.WINDOW_OPENS)
     assert "Thu 27 Aug, 5:30 to 8:00 PM" in content.text
     assert "Fri 28 Aug, 10:00 AM" in content.text
 

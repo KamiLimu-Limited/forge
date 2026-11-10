@@ -7,15 +7,15 @@ from fastapi import APIRouter, Depends, Query
 
 from forge.api.deps import ActiveUser, DbSession
 from forge.models import CohortEnrollment
-from forge.schemas.mentorship import SkillProgressResponse
 from forge.schemas.points import (
     AttendanceRateResponse,
+    GraduationStatus,
     GraduationStatusResponse,
     PointsBreakdownResponse,
     PointsDetailResponse,
     RateBucket,
 )
-from forge.services import mentorship as mentorship_service
+from forge.services import graduation as graduation_service
 from forge.services import points as points_service
 from forge.services.access import ensure_can_view_mentee, get_cohort_or_404
 from forge.services.points import MenteeStats
@@ -47,19 +47,22 @@ Stats = Annotated[MenteeStats, Depends(mentee_stats)]
 
 @router.get("/points")
 async def get_points(stats: Stats) -> PointsBreakdownResponse:
-    """Core points earned against points available so far, plus approved extra-activity points."""
+    """Core points earned against points available so far, active extra-activity
+    points, and the missed and remaining buckets."""
     return points_service.breakdown(stats)
 
 
 @router.get("/points/breakdown")
 async def get_points_breakdown(stats: Stats, db: DbSession) -> PointsDetailResponse:
-    """Per-session outcomes and the approved activities behind the totals."""
+    """Per-session outcomes (present, absent, missed, excused, remaining) and the
+    active extra activities behind the totals."""
     return await points_service.detailed_breakdown(db, stats)
 
 
 @router.get("/attendance-rates")
 async def get_attendance_rates(stats: Stats) -> AttendanceRateResponse:
-    """Core and combined rates, broken down by KamiLimu month, track and session type."""
+    """Core rate and overall rate (core plus extra-activity points), broken down by
+    KamiLimu month, track and session type."""
     return points_service.rates(stats)
 
 
@@ -79,15 +82,19 @@ async def get_track_rates(stats: Stats) -> list[RateBucket]:
 async def get_graduation_status(
     stats: Stats, enrollment: MenteeEnrollment, db: DbSession
 ) -> GraduationStatusResponse:
-    """`on_track`, `warning` (within the warning margin above the threshold) or
-    `at_risk`. Final once the cohort is completed: `graduated` or `not_graduated`."""
+    """Core and overall rates against the threshold. `status` is set once the
+    cohort graduates: `graduated` or `not_graduated`, decided on the core rate."""
     cohort = await get_cohort_or_404(db, enrollment.cohort_id)
-    return points_service.graduation(stats, cohort)
-
-
-@router.get("/skill-progress")
-async def get_skill_progress(
-    enrollment: MenteeEnrollment, db: DbSession
-) -> SkillProgressResponse:
-    """The mentee's early, mid and late self-ratings and the change per skill."""
-    return await mentorship_service.skill_progress(db, enrollment)
+    response = points_service.graduation(stats, cohort)
+    frozen = await graduation_service.frozen_result(db, cohort.id, enrollment.user_id)
+    if frozen is None:
+        return response
+    return response.model_copy(
+        update={
+            "status": GraduationStatus.GRADUATED
+            if frozen.graduated
+            else GraduationStatus.NOT_GRADUATED,
+            "core_rate": frozen.core_rate,
+            "overall_rate": frozen.overall_rate,
+        }
+    )

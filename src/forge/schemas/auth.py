@@ -10,6 +10,7 @@ from forge.core.config import settings
 from forge.core.security import validate_password
 from forge.models import UserRole
 from forge.schemas.common import Name, PageParams, RequestSchema, Schema
+from forge.schemas.user import ProfileFields
 
 
 def _strong_password(value: str) -> str:
@@ -32,11 +33,23 @@ class UserInviteRequest(RequestSchema):
     cohort_id: UUID | None = None
 
 
-class BulkInviteUserEntry(RequestSchema):
+class BulkInviteUserEntry(ProfileFields):
+    """An invitee and their profile. ICT tracks and peer mentors are assigned
+    later, through track selection and enrollment."""
+
     email: EmailStr
     first_name: Name
     last_name: Name
     roles: list[UserRole] = Field(min_length=1)
+
+    def profile(self) -> dict[str, object] | None:
+        """The profile fields given, JSON-ready for the invitation."""
+        return (
+            self.model_dump(
+                mode="json", include=set(ProfileFields.model_fields), exclude_none=True
+            )
+            or None
+        )
 
 
 class BulkInviteRequest(RequestSchema):

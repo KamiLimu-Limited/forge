@@ -15,6 +15,7 @@ from forge.core.exceptions import (
 )
 from forge.models import (
     AttendanceRecord,
+    AttendanceSource,
     AttendanceStatus,
     AttendanceWindow,
     AttendanceWindowOverride,
@@ -25,7 +26,6 @@ from forge.models import (
     ProgrammeSession,
     User,
     UserRole,
-    UserRoleAssignment,
 )
 from forge.schemas.attendance import (
     AttendanceFilters,
@@ -36,10 +36,11 @@ from forge.schemas.attendance import (
     OverrideRequestCreate,
     OverrideReviewRequest,
     WindowStatusResponse,
+    check_submission,
 )
 from forge.services.access import (
-    ensure_cohort_staff,
-    get_enrollment,
+    ensure_cohort_manager,
+    get_participant_enrollment,
     group_mentee_ids,
     is_cohort_staff,
 )
@@ -49,7 +50,7 @@ from forge.services.eligibility import (
     applies_to_enrollment,
     session_applies,
 )
-from forge.services.notifications import notify
+from forge.services.notifications import cohort_manager_ids, notify
 from forge.services.pagination import paginate
 from forge.services.sessions import get_session_or_404
 from forge.services.windows import (
@@ -70,7 +71,7 @@ async def _eligible_session(
     db: AsyncSession, mentee: User, session_id: uuid.UUID
 ) -> ProgrammeSession:
     session = await get_session_or_404(db, session_id)
-    enrollment = await get_enrollment(db, mentee.id, session.cohort_id)
+    enrollment = await get_participant_enrollment(db, mentee.id, session.cohort_id)
     if enrollment is None or not session_applies(session, enrollment):
         raise PermissionDenied("This session does not apply to you")
     if session.status not in COUNTED_STATUSES:
@@ -91,9 +92,15 @@ async def _open_window_or_raise(
     return window
 
 
+def _source(window: AttendanceWindow) -> AttendanceSource:
+    """``reopened`` when only the participant's approved extension keeps it open."""
+    return AttendanceSource.ON_TIME if is_open(window) else AttendanceSource.REOPENED
+
+
 def _apply(
     record: AttendanceRecord,
     data: AttendanceSubmissionRequest | AttendanceUpdateRequest,
+    window: AttendanceWindow,
 ) -> None:
     # A submission replaces every field; an update only touches the fields sent.
     partial = isinstance(data, AttendanceUpdateRequest)
@@ -101,15 +108,9 @@ def _apply(
         exclude_unset=partial, exclude={"session_id"}
     ).items():
         setattr(record, key, value)
-    if record.status is AttendanceStatus.NOT_ATTENDED:
-        for field in (
-            "quality_rating",
-            "usefulness_rating",
-            "understanding_score",
-            "academic_application_score",
-            "career_application_score",
-        ):
-            setattr(record, field, None)
+    if record.status is AttendanceStatus.ABSENT:
+        record.ratings = None
+    record.source = _source(window)
     record.submitted_at = _now()
 
 
@@ -117,7 +118,7 @@ async def submit_attendance(
     db: AsyncSession, mentee: User, data: AttendanceSubmissionRequest
 ) -> AttendanceRecord:
     session = await _eligible_session(db, mentee, data.session_id)
-    await _open_window_or_raise(db, session.id, mentee.id)
+    window = await _open_window_or_raise(db, session.id, mentee.id)
 
     record = await db.scalar(
         select(AttendanceRecord).where(
@@ -132,7 +133,7 @@ async def submit_attendance(
     if record is None:
         record = AttendanceRecord(mentee_id=mentee.id, session_id=session.id)
         db.add(record)
-    _apply(record, data)
+    _apply(record, data, window)
     await db.flush()
     log_action(
         db,
@@ -176,22 +177,25 @@ async def update_attendance(
         raise PermissionDenied("You can only update your own attendance")
     if record.status not in (
         *SUBMITTABLE,
-        AttendanceStatus.ATTENDED,
-        AttendanceStatus.NOT_ATTENDED,
+        AttendanceStatus.PRESENT,
+        AttendanceStatus.ABSENT,
     ):
         raise BusinessRuleViolation(
-            f"A record marked {record.status.value} can only be changed by the committee"
+            f"A record marked {record.status.value} can only be changed by a manager"
         )
-    await _open_window_or_raise(db, record.session_id, mentee.id)
-    if data.status is None and record.status in SUBMITTABLE:
-        data = data.model_copy(update={"status": AttendanceStatus.ATTENDED})
-    if (
-        data.status or record.status
-    ) is AttendanceStatus.NOT_ATTENDED and data.has_ratings():
-        raise BusinessRuleViolation(
-            "Ratings can only be given for sessions you attended"
-        )
-    _apply(record, data)
+    window = await _open_window_or_raise(db, record.session_id, mentee.id)
+    status = data.status or record.status
+    if status in SUBMITTABLE:
+        raise BusinessRuleViolation("Set status to present or absent")
+    sent = data.model_dump(exclude_unset=True)
+    ratings = sent.get("ratings", record.ratings)
+    if data.status is AttendanceStatus.ABSENT and "ratings" not in sent:
+        ratings = None
+    try:
+        check_submission(status, ratings, sent.get("feedback", record.feedback))
+    except ValueError as e:
+        raise BusinessRuleViolation(str(e)) from e
+    _apply(record, data, window)
     log_action(
         db,
         "update_attendance",
@@ -210,7 +214,7 @@ async def set_record_status(
     record: AttendanceRecord,
     data: AttendanceStatusUpdateRequest,
 ) -> AttendanceRecord:
-    ensure_cohort_staff(staff, record.session.cohort_id)
+    ensure_cohort_manager(staff, record.session.cohort_id)
     old = record.status
     record.status = data.status
     log_action(
@@ -292,6 +296,7 @@ async def close_window(
     window = await db.get(AttendanceWindow, window_id)
     if window is None:
         raise NotFound("Attendance window not found")
+    ensure_cohort_manager(admin, window.session.cohort_id)
     if window.is_active:
         window.is_active = False
         window.closed_at = _now()
@@ -307,9 +312,10 @@ async def close_window(
 
 
 async def close_expired_windows(db: AsyncSession) -> int:
-    """Deactivate expired windows and record ``missed`` for eligible mentees who never submitted.
+    """Deactivate expired windows and record ``missed`` for eligible participants
+    who never submitted.
 
-    Mentees holding an override that is still open are skipped until it expires.
+    Participants holding an override that is still open are skipped until it expires.
     """
     now = _now()
     expired = await db.scalars(
@@ -382,20 +388,19 @@ async def create_override_request(
     if pending is not None:
         raise Conflict("You already have a pending override request for this session")
 
+    if data.requested_closes_at is not None and data.requested_closes_at <= _now():
+        raise BusinessRuleViolation("requested_closes_at must be in the future")
     request = OverrideRequest(
-        mentee_id=mentee.id, session_id=session.id, reason=data.reason
+        mentee_id=mentee.id,
+        session_id=session.id,
+        reason=data.reason,
+        requested_closes_at=data.requested_closes_at,
     )
     db.add(request)
     await db.flush()
-    committee = await db.scalars(
-        select(UserRoleAssignment.user_id).where(
-            UserRoleAssignment.role == UserRole.COMMITTEE,
-            UserRoleAssignment.cohort_id == session.cohort_id,
-        )
-    )
     notify(
         db,
-        committee,
+        await cohort_manager_ids(db, session.cohort_id),
         NotificationType.OVERRIDE_SUBMITTED,
         {
             "mentee": mentee.full_name,
@@ -429,14 +434,21 @@ async def list_override_requests(
         .order_by(OverrideRequest.created_at.desc())
     )
     if not user.is_admin:
-        committee_scopes = {
-            r.cohort_id for r in user.roles if r.role is UserRole.COMMITTEE
+        staff_scopes = {
+            r.cohort_id
+            for r in user.roles
+            if r.role
+            in (
+                UserRole.PROGRAM_LEAD,
+                UserRole.COMMITTEE,
+                UserRole.PROGRAM_DELIVERY_LEAD,
+            )
         }
-        if None not in committee_scopes:  # a global committee role sees every cohort
+        if None not in staff_scopes:  # a global staff role sees every cohort
             stmt = stmt.where(
                 or_(
                     OverrideRequest.mentee_id == user.id,
-                    ProgrammeSession.cohort_id.in_(committee_scopes),
+                    ProgrammeSession.cohort_id.in_(staff_scopes),
                 )
             )
     if filters.status:
@@ -464,7 +476,7 @@ async def review_override_request(
     data: OverrideReviewRequest,
     approve: bool,
 ) -> OverrideRequest:
-    ensure_cohort_staff(reviewer, request.session.cohort_id)
+    ensure_cohort_manager(reviewer, request.session.cohort_id)
     if request.status is not OverrideRequestStatus.PENDING:
         raise BusinessRuleViolation(f"Request has already been {request.status.value}")
 
@@ -485,8 +497,10 @@ async def review_override_request(
         window = await get_window(db, request.session_id)
         if window is None:
             raise BusinessRuleViolation("Session has no attendance window")
-        new_closes_at = data.new_closes_at or _now() + timedelta(
-            hours=settings.OVERRIDE_EXTENSION_HOURS
+        new_closes_at = (
+            data.new_closes_at
+            or request.requested_closes_at
+            or _now() + timedelta(hours=settings.OVERRIDE_EXTENSION_HOURS)
         )
         if new_closes_at <= _now():
             raise BusinessRuleViolation("new_closes_at must be in the future")

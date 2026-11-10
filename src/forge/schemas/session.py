@@ -1,6 +1,6 @@
 """Programme session schemas."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Self
 from uuid import UUID
 
@@ -16,6 +16,24 @@ from forge.models import (
 )
 from forge.schemas.common import PageParams, RequestSchema, Schema, Title
 from forge.schemas.user import UserSummary
+
+# Calendar sessions are short; peer mentorship sessions (tasks) run for weeks.
+MAX_SESSION_LENGTH = timedelta(hours=12)
+MAX_TASK_LENGTH = timedelta(days=60)
+
+
+def check_times(
+    starts_at: datetime, ends_at: datetime, category: SessionCategory
+) -> None:
+    if ends_at <= starts_at:
+        raise ValueError("ends_at must be after starts_at")
+    limit = (
+        MAX_TASK_LENGTH
+        if category is SessionCategory.PEER_MENTORSHIP
+        else MAX_SESSION_LENGTH
+    )
+    if ends_at - starts_at > limit:
+        raise ValueError(f"A {category.value} session can last at most {limit}")
 
 
 class MentorAssignment(RequestSchema):
@@ -34,26 +52,28 @@ class SessionFields(RequestSchema):
     kami_limu_month: int | None = Field(
         None, ge=1, le=24, description="Derived from the cohort calendar when omitted"
     )
-    track: str | None = Field(None, description="ICT track; required for ICT sessions")
-    mode: SessionMode | None = None
-    location: str | None = Field(None, max_length=255)
-    points: int | None = Field(None, ge=0, le=1000)
-    attendance_deadline: AwareDatetime | None = Field(
-        None, description="Explicit attendance deadline (peer mentorship sessions)"
+    track: str | None = Field(
+        None, description="ICT track for ICT sessions; core sessions have none"
     )
+    mode: SessionMode | None = None
+    location: str | None = Field(
+        None, max_length=255, description="Venue, or meeting link when virtual"
+    )
+    points: int | None = Field(None, ge=0, le=1000)
 
 
 class SessionCreateRequest(SessionFields):
     cohort_id: UUID
     title: Title
     starts_at: AwareDatetime
-    duration_minutes: int = Field(ge=15, le=12 * 60)
+    ends_at: AwareDatetime = Field(
+        description="End time; for peer mentorship sessions, the task deadline"
+    )
     category: SessionCategory
-    session_type: SessionType = SessionType.CORE
+    session_type: SessionType = SessionType.THEORY
     mode: SessionMode = SessionMode.PHYSICAL
     status: SessionStatus = Field(
-        SessionStatus.DRAFT,
-        description="`draft` or `published`; publishing notifies the cohort",
+        SessionStatus.DRAFT, description="`draft` or `published`"
     )
     mentors: list[MentorAssignment] = []
     resources: list[ResourceIn] = []
@@ -62,8 +82,7 @@ class SessionCreateRequest(SessionFields):
     def check(self) -> Self:
         if self.status not in (SessionStatus.DRAFT, SessionStatus.PUBLISHED):
             raise ValueError("New sessions must be draft or published")
-        if self.session_type is SessionType.ICT and not self.track:
-            raise ValueError("ICT sessions require a track")
+        check_times(self.starts_at, self.ends_at, self.category)
         return self
 
 
@@ -73,13 +92,16 @@ class SessionUpdateRequest(SessionFields):
     session_type: SessionType | None = None
     status: SessionStatus | None = Field(
         None,
-        description="Publish (`published`) or close out (`completed`); use DELETE to cancel",
+        description="Publish (`published`) or close out (`completed`); use DELETE "
+        "to cancel and `/reschedule` to move it",
     )
 
 
 class SessionRescheduleRequest(RequestSchema):
     starts_at: AwareDatetime
-    duration_minutes: int | None = Field(None, ge=15, le=12 * 60)
+    ends_at: AwareDatetime | None = Field(
+        None, description="Defaults to keeping the session's length"
+    )
     reason: str | None = Field(None, max_length=500)
 
 
@@ -115,7 +137,6 @@ class SessionResponse(Schema):
     kami_limu_month: int
     starts_at: datetime
     ends_at: datetime
-    duration_minutes: int
     category: SessionCategory
     session_type: SessionType
     track: str | None
@@ -123,7 +144,6 @@ class SessionResponse(Schema):
     location: str | None
     points: int
     status: SessionStatus
-    attendance_deadline: datetime | None
     original_starts_at: datetime | None
     mentors: list[SessionMentorResponse]
     resources: list[SessionResourceResponse]
@@ -156,3 +176,19 @@ class CalendarMonth(Schema):
     month: int
     name: str | None
     sessions: list[SessionResponse]
+
+
+class InProgressSession(Schema):
+    session: SessionResponse
+    closes_at: datetime = Field(description="When the caller's window closes")
+    submitted: bool
+
+
+class SessionNoteRequest(RequestSchema):
+    body: str = Field(max_length=20_000)
+
+
+class SessionNoteResponse(Schema):
+    session_id: UUID
+    body: str
+    updated_at: datetime

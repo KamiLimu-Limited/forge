@@ -5,7 +5,15 @@ from datetime import UTC, datetime, timedelta
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from forge.models import Notification, NotificationType, SessionStatus
+from forge.models import (
+    AttendanceWindow,
+    Notification,
+    NotificationType,
+    SessionCategory,
+    SessionStatus,
+    UserRole,
+)
+from forge.services.sessions import advance_statuses
 from tests.conftest import Factory, Programme, token_for
 
 
@@ -15,12 +23,12 @@ def session_payload(cohort_id, **overrides):
         "cohort_id": str(cohort_id),
         "title": "Intro to Git",
         "starts_at": starts.isoformat(),
-        "duration_minutes": 120,
+        "ends_at": (starts + timedelta(hours=2)).isoformat(),
         "category": "thursday",
     } | overrides
 
 
-async def test_committee_publishes_session_and_cohort_is_notified(
+async def test_program_lead_publishes_session(
     client: AsyncClient, programme: Programme, db_session
 ):
     response = await client.post(
@@ -33,12 +41,13 @@ async def test_committee_publishes_session_and_cohort_is_notified(
                 {"resource_type": "slides", "url": "https://example.com/slides"}
             ],
         ),
-        headers=token_for(programme.committee),
+        headers=token_for(programme.program_lead),
     )
 
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["points"] == 10
+    assert body["session_type"] == "theory"
     assert body["kami_limu_month"] >= 1
     assert body["mentors"][0]["user"]["email"] == "prof@test.com"
 
@@ -49,19 +58,61 @@ async def test_committee_publishes_session_and_cohort_is_notified(
     ends = datetime.fromisoformat(body["ends_at"])
     assert datetime.fromisoformat(window["closes_at"]) == ends + timedelta(hours=24)
 
-    notified = await db_session.scalars(
-        select(Notification.user_id).where(
-            Notification.notification_type == NotificationType.SESSION_PUBLISHED
-        )
+
+async def test_committee_cannot_schedule(client: AsyncClient, programme: Programme):
+    response = await client.post(
+        "/api/v1/sessions",
+        json=session_payload(programme.cohort.id),
+        headers=token_for(programme.committee),
     )
-    assert {m.id for m in programme.mentees} <= set(notified)
+
+    assert response.status_code == 403
+
+
+async def test_program_delivery_lead_runs_peer_mentorship_only(
+    client: AsyncClient, programme: Programme, factory: Factory
+):
+    pdl = await factory.user()
+    await factory.enroll(pdl, programme.cohort, UserRole.PROGRAM_DELIVERY_LEAD)
+    headers = token_for(pdl)
+    start = datetime.now(UTC) + timedelta(days=1)
+
+    task = await client.post(
+        "/api/v1/sessions",
+        json=session_payload(
+            programme.cohort.id,
+            category="peer_mentorship",
+            ends_at=(start + timedelta(days=14)).isoformat(),
+            starts_at=start.isoformat(),
+        ),
+        headers=headers,
+    )
+    thursday = await client.post(
+        "/api/v1/sessions", json=session_payload(programme.cohort.id), headers=headers
+    )
+    edited = await client.patch(
+        f"/api/v1/sessions/{task.json()['id']}",
+        json={"title": "Reflection task"},
+        headers=headers,
+    )
+    to_thursday = await client.patch(
+        f"/api/v1/sessions/{task.json()['id']}",
+        json={"category": "thursday"},
+        headers=headers,
+    )
+
+    assert task.status_code == 201, task.text
+    assert thursday.status_code == 403
+    assert edited.json()["title"] == "Reflection task"
+    assert to_thursday.status_code == 403
 
 
 async def test_saturday_and_peer_mentorship_windows(
     client: AsyncClient, programme: Programme
 ):
-    headers = token_for(programme.committee)
-    deadline = datetime.now(UTC) + timedelta(days=10)
+    headers = token_for(programme.program_lead)
+    starts = datetime.now(UTC) + timedelta(days=3)
+    deadline = starts + timedelta(days=14)
 
     saturday = await client.post(
         "/api/v1/sessions",
@@ -75,9 +126,19 @@ async def test_saturday_and_peer_mentorship_windows(
         json=session_payload(
             programme.cohort.id,
             category="peer_mentorship",
-            session_type="peer_mentorship",
+            session_type="hands_on",
             status="published",
-            attendance_deadline=deadline.isoformat(),
+            starts_at=starts.isoformat(),
+            ends_at=deadline.isoformat(),
+        ),
+        headers=headers,
+    )
+    too_long = await client.post(
+        "/api/v1/sessions",
+        json=session_payload(
+            programme.cohort.id,
+            ends_at=deadline.isoformat(),
+            starts_at=starts.isoformat(),
         ),
         headers=headers,
     )
@@ -92,26 +153,31 @@ async def test_saturday_and_peer_mentorship_windows(
         sat["attendance_window"]["closes_at"]
     ) == datetime.fromisoformat(sat["ends_at"]) + timedelta(hours=48)
     assert datetime.fromisoformat(pm["attendance_window"]["closes_at"]) == deadline
+    assert too_long.status_code == 422
 
 
-async def test_ict_session_requires_offered_track(
-    client: AsyncClient, programme: Programme
-):
-    headers = token_for(programme.committee)
+async def test_session_enums(client: AsyncClient, programme: Programme):
+    headers = token_for(programme.program_lead)
 
-    missing = await client.post(
+    unknown_track = await client.post(
         "/api/v1/sessions",
-        json=session_payload(programme.cohort.id, session_type="ict"),
+        json=session_payload(programme.cohort.id, track="ai"),
         headers=headers,
     )
-    unknown = await client.post(
+    hybrid = await client.post(
         "/api/v1/sessions",
-        json=session_payload(programme.cohort.id, session_type="ict", track="ai"),
+        json=session_payload(programme.cohort.id, mode="hybrid"),
+        headers=headers,
+    )
+    old_type = await client.post(
+        "/api/v1/sessions",
+        json=session_payload(programme.cohort.id, session_type="core"),
         headers=headers,
     )
 
-    assert missing.status_code == 422
-    assert unknown.status_code == 422
+    assert unknown_track.status_code == 422
+    assert hybrid.status_code == 422
+    assert old_type.status_code == 422
 
 
 async def test_mentees_cannot_create_or_see_drafts(
@@ -142,7 +208,7 @@ async def test_publish_draft_via_patch(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     draft = await factory.session(programme.cohort, status=SessionStatus.DRAFT)
-    headers = token_for(programme.committee)
+    headers = token_for(programme.program_lead)
 
     response = await client.patch(
         f"/api/v1/sessions/{draft.id}", json={"status": "published"}, headers=headers
@@ -157,7 +223,7 @@ async def test_reschedule_keeps_history_and_resets_window(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     session = await factory.session(programme.cohort)
-    headers = token_for(programme.committee)
+    headers = token_for(programme.program_lead)
     new_start = datetime.now(UTC) + timedelta(days=7)
 
     response = await client.post(
@@ -170,6 +236,9 @@ async def test_reschedule_keeps_history_and_resets_window(
     ).json()
 
     assert response.status_code == 200
+    assert detail["status"] == "rescheduled"
+    ends_at = datetime.fromisoformat(detail["ends_at"])
+    assert ends_at - new_start == timedelta(hours=2)
     assert detail["original_starts_at"] is not None
     assert detail["reschedule_history"][0]["reason"] == "Venue unavailable"
     assert datetime.fromisoformat(detail["attendance_window"]["opens_at"]) == new_start
@@ -179,7 +248,7 @@ async def test_cancel_session_closes_window(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     session = await factory.session(programme.cohort)
-    headers = token_for(programme.committee)
+    headers = token_for(programme.admin)
 
     response = await client.request(
         "DELETE",
@@ -200,7 +269,7 @@ async def test_mentor_can_update_resources_but_not_mentee(
     client: AsyncClient, programme: Programme, factory: Factory
 ):
     session = await factory.session(programme.cohort)
-    headers = token_for(programme.committee)
+    headers = token_for(programme.program_lead)
     await client.put(
         f"/api/v1/sessions/{session.id}/mentors",
         json={"mentors": [{"user_id": str(programme.prof_mentor.id)}]},
@@ -270,3 +339,93 @@ async def test_session_filters(
 
     assert response.json()["total"] == 1
     assert unknown.status_code == 422
+
+
+async def test_statuses_advance_with_the_window(
+    db_session, programme: Programme, factory: Factory
+):
+    live = await factory.session(programme.cohort)
+    done = await factory.session(
+        programme.cohort, starts_at=datetime.now(UTC) - timedelta(days=5)
+    )
+    upcoming = await factory.session(
+        programme.cohort, starts_at=datetime.now(UTC) + timedelta(days=2)
+    )
+
+    await advance_statuses(db_session)
+    for session in (live, done, upcoming):
+        await db_session.refresh(session)
+    opened = list(
+        await db_session.scalars(
+            select(Notification.user_id).where(
+                Notification.notification_type == NotificationType.WINDOW_OPENS,
+                Notification.related_resource_id == live.id,
+            )
+        )
+    )
+
+    assert live.status is SessionStatus.LIVE
+    assert done.status is SessionStatus.COMPLETED
+    assert upcoming.status is SessionStatus.PUBLISHED
+    assert {m.id for m in programme.mentees} <= set(opened)
+
+
+async def test_in_progress_lists_open_windows_and_tasks(
+    client: AsyncClient, programme: Programme, factory: Factory, db_session
+):
+    now = datetime.now(UTC)
+    thursday = await factory.session(programme.cohort, title="Thursday")
+    task = await factory.session(
+        programme.cohort,
+        title="Task",
+        category=SessionCategory.PEER_MENTORSHIP,
+        starts_at=now - timedelta(days=2),
+        ends_at=now + timedelta(days=12),
+    )
+    await factory.session(
+        programme.cohort, title="Old", starts_at=now - timedelta(days=5)
+    )
+    await factory.session(
+        programme.cohort, title="Future", starts_at=now + timedelta(days=2)
+    )
+    await client.post(
+        "/api/v1/attendance",
+        json={"session_id": str(thursday.id), "status": "absent"},
+        headers=token_for(programme.mentees[0]),
+    )
+
+    response = await client.get(
+        "/api/v1/sessions/in-progress", headers=token_for(programme.mentees[0])
+    )
+    committee = await client.get(
+        "/api/v1/sessions/in-progress", headers=token_for(programme.committee)
+    )
+
+    items = response.json()
+    assert [i["session"]["title"] for i in items] == ["Thursday", "Task"]
+    assert [i["submitted"] for i in items] == [True, False]
+    window = await db_session.scalar(
+        select(AttendanceWindow).where(AttendanceWindow.session_id == task.id)
+    )
+    assert datetime.fromisoformat(items[1]["closes_at"]) == window.closes_at
+    assert committee.status_code == 403
+
+
+async def test_personal_notes_are_private(
+    client: AsyncClient, programme: Programme, factory: Factory
+):
+    session = await factory.session(programme.cohort)
+    url = f"/api/v1/sessions/{session.id}/notes/me"
+    mine = token_for(programme.mentees[0])
+
+    empty = await client.get(url, headers=mine)
+    saved = await client.put(url, json={"body": "remember git rebase"}, headers=mine)
+    edited = await client.put(url, json={"body": "and git bisect"}, headers=mine)
+    read = await client.get(url, headers=mine)
+    other = await client.get(url, headers=token_for(programme.mentees[1]))
+
+    assert empty.status_code == 404
+    assert saved.json()["body"] == "remember git rebase"
+    assert edited.status_code == 200
+    assert read.json()["body"] == "and git bisect"
+    assert other.status_code == 404
