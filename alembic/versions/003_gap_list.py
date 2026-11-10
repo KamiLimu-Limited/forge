@@ -346,7 +346,7 @@ def upgrade() -> None:
         "SELECT coalesce(jsonb_agg(CASE WHEN r = 'peer_mentor_1:1' "
         "THEN 'peer_mentor_1_1' ELSE r END), '[]'::jsonb) "
         "FROM jsonb_array_elements_text(intended_roles) AS r WHERE r <> 'partner') "
-        "WHERE intended_roles IS NOT NULL"
+        "WHERE jsonb_typeof(intended_roles) = 'array'"
     )
     op.add_column(
         "invitations",
@@ -462,7 +462,7 @@ def upgrade() -> None:
         "INSERT INTO cohort_ict_tracks (id, cohort_id, name) "
         "SELECT gen_random_uuid(), c.id, t FROM cohorts c, "
         "jsonb_array_elements_text(c.ict_tracks_offered) AS t "
-        "WHERE c.ict_tracks_offered IS NOT NULL"
+        "WHERE jsonb_typeof(c.ict_tracks_offered) = 'array'"
     )
     for column in (
         "skill_names",
@@ -981,7 +981,7 @@ def downgrade() -> None:
         "THEN 'peer_mentor_1:1' ELSE r END), '[]'::jsonb) "
         "FROM jsonb_array_elements_text(intended_roles) AS r "
         "WHERE r NOT IN ('program_lead', 'program_delivery_lead')) "
-        "WHERE intended_roles IS NOT NULL"
+        "WHERE jsonb_typeof(intended_roles) = 'array'"
     )
 
     op.execute(
