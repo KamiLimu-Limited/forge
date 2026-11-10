@@ -64,7 +64,10 @@ class Settings(BaseSettings):
     # Email (Resend)
     RESEND_API_KEY: str = ""
     EMAIL_FROM_ADDRESS: str = "noreply@kamilimu.org"
-    EMAIL_FROM_NAME: str = "KamiLimu Forge"
+    EMAIL_FROM_NAME: str = "KamiLimu"
+    EMAIL_REPLY_TO: str = ""
+    # Absolute public URL of the wordmark; defaults to the copy the frontend serves.
+    EMAIL_LOGO_URL: str = ""
     FRONTEND_URL: AnyHttpUrl = AnyHttpUrl("http://localhost:3000")
 
     # Background scheduler
@@ -89,9 +92,25 @@ class Settings(BaseSettings):
                 return "postgresql+asyncpg://" + v.removeprefix(prefix)
         return v
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def use_asyncpg_driver(cls, v: str) -> str:
+        """Accept the plain ``postgres://`` URLs that hosts like Render hand out."""
+        for prefix in ("postgres://", "postgresql://"):
+            if isinstance(v, str) and v.startswith(prefix):
+                return "postgresql+asyncpg://" + v.removeprefix(prefix)
+        return v
+
     @property
     def frontend_base_url(self) -> str:
         return str(self.FRONTEND_URL).rstrip("/")
+
+    @property
+    def email_logo_url(self) -> str:
+        return (
+            self.EMAIL_LOGO_URL
+            or f"{self.frontend_base_url}/logos/kamilimu-wordmark.png"
+        )
 
 
 @lru_cache
