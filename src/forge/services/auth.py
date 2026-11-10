@@ -22,6 +22,7 @@ from forge.core.jwt import (
     TokenType,
     create_access_token,
     create_refresh_token,
+    create_token,
     decode_token,
     get_token_payload,
 )
@@ -45,6 +46,20 @@ from forge.schemas.auth import (
 from forge.schemas.cohort import EnrollmentRequest
 from forge.services.audit import log_action
 from forge.services.cohorts import add_enrollment, ensure_role_assignment
+
+# Roles that apply across cohorts and are never cohort enrollments.
+GLOBAL_ROLES = (UserRole.ADMIN, UserRole.PROGRAM_LEAD, UserRole.ALUMNI)
+REQUIRED_CSV_COLUMNS = {"email", "first_name", "last_name", "roles"}
+SOCIAL_CSV_COLUMNS = {"linkedin", "github", "instagram", "twitter", "website"}
+PROFILE_CSV_COLUMNS = {
+    "university",
+    "programme_of_study",
+    "degree_level",
+    "gender",
+    "phone",
+    "birthday",
+    *SOCIAL_CSV_COLUMNS,
+}
 
 
 def issue_tokens(user_id: uuid.UUID) -> TokenResponse:
@@ -89,6 +104,7 @@ async def _stage_invitation(
         last_name=entry.last_name,
         intended_roles=[r.value for r in entry.roles],
         intended_cohort_id=cohort_id,
+        profile=entry.profile() if isinstance(entry, BulkInviteUserEntry) else None,
     )
     db.add(invitation)
     await db.flush()
@@ -104,10 +120,8 @@ async def _stage_invitation(
 
 
 async def _ensure_cohort(db: AsyncSession, cohort_id: uuid.UUID | None) -> None:
-    if cohort_id is not None:
-        cohort = await db.get(Cohort, cohort_id)
-        if cohort is None or cohort.deleted_at is not None:
-            raise NotFound("Cohort not found")
+    if cohort_id is not None and await db.get(Cohort, cohort_id) is None:
+        raise NotFound("Cohort not found")
 
 
 async def create_invitation(
@@ -154,28 +168,47 @@ async def bulk_create_invitations(
 def parse_invite_csv(
     content: bytes,
 ) -> tuple[list[BulkInviteUserEntry], list[BulkInviteResultEntry]]:
-    """Parse ``email,first_name,last_name,roles`` rows; roles are ``;``-separated."""
+    """Parse ``email,first_name,last_name,roles`` rows (roles ``;``-separated) with
+    optional profile columns."""
     try:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as e:
         raise BadRequest("CSV must be UTF-8 encoded") from e
 
     reader = csv.DictReader(io.StringIO(text))
-    required = {"email", "first_name", "last_name", "roles"}
-    if not reader.fieldnames or not required <= {f.strip() for f in reader.fieldnames}:
-        raise BadRequest(f"CSV must have columns: {', '.join(sorted(required))}")
+    columns = {f.strip() for f in reader.fieldnames or []}
+    if not columns >= REQUIRED_CSV_COLUMNS:
+        raise BadRequest(
+            f"CSV must have columns: {', '.join(sorted(REQUIRED_CSV_COLUMNS))}"
+        )
+    if unknown := columns - REQUIRED_CSV_COLUMNS - PROFILE_CSV_COLUMNS:
+        raise BadRequest(
+            f"Unknown CSV columns: {', '.join(sorted(unknown))}. ICT tracks and "
+            "peer mentors are assigned after enrolment."
+        )
 
     entries: list[BulkInviteUserEntry] = []
     errors: list[BulkInviteResultEntry] = []
     for line, row in enumerate(reader, start=2):
         row = {k.strip(): (v or "").strip() for k, v in row.items() if k}
         try:
+            social = {k: row[k] for k in SOCIAL_CSV_COLUMNS if row.get(k)}
             entries.append(
-                BulkInviteUserEntry(
-                    email=row["email"],
-                    first_name=row["first_name"],
-                    last_name=row["last_name"],
-                    roles=[r.strip() for r in row["roles"].split(";") if r.strip()],
+                BulkInviteUserEntry.model_validate(
+                    {
+                        "email": row["email"],
+                        "first_name": row["first_name"],
+                        "last_name": row["last_name"],
+                        "roles": [
+                            r.strip() for r in row["roles"].split(";") if r.strip()
+                        ],
+                        **{
+                            k: row[k]
+                            for k in PROFILE_CSV_COLUMNS - SOCIAL_CSV_COLUMNS
+                            if row.get(k)
+                        },
+                        "social_links": social or None,
+                    }
                 )
             )
         except ValidationError as e:
@@ -225,6 +258,8 @@ async def activate_account(
         )
         db.add(user)
 
+    for key, value in (invitation.profile or {}).items():
+        setattr(user, key, value)
     user.password_hash = hash_password(password)
     user.account_state = AccountState.ACTIVE
     user.last_login_at = _now()
@@ -238,7 +273,7 @@ async def activate_account(
     )
     for role_value in invitation.intended_roles or []:
         role = UserRole(role_value)
-        if cohort is not None and role is not UserRole.ADMIN:
+        if cohort is not None and role not in GLOBAL_ROLES:
             await add_enrollment(
                 db,
                 cohort,
@@ -291,6 +326,14 @@ async def authenticate_user(
     )
     await db.commit()
     return user, issue_tokens(user.id)
+
+
+def confirm_password(user: User, password: str) -> tuple[str, datetime]:
+    """Re-check the caller's password and return a short-lived confirmation token."""
+    if not user.password_hash or not verify_password(password, user.password_hash):
+        raise Unauthorized("Incorrect password")
+    token, _, expires_at = create_token(str(user.id), TokenType.CONFIRMATION)
+    return token, expires_at
 
 
 async def _is_revoked(db: AsyncSession, jti: str) -> bool:

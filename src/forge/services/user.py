@@ -9,12 +9,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from forge.core.config import settings
 from forge.core.exceptions import BadRequest, Conflict, NotFound
 from forge.core.security import generate_secure_token
-from forge.models import AccountState, Invitation, User, UserRoleAssignment
+from forge.models import (
+    AccountState,
+    Cohort,
+    CohortEnrollment,
+    Invitation,
+    User,
+    UserRole,
+    UserRoleAssignment,
+)
 from forge.schemas.auth import InvitationFilters
 from forge.schemas.user import (
+    ActiveCohortRequest,
     AdminUserUpdateRequest,
+    CohortBrief,
+    MyCohort,
     RoleAssignmentRequest,
     UserFilters,
+    UserProfileResponse,
     UserProfileUpdateRequest,
 )
 from forge.services.audit import log_action
@@ -28,11 +40,70 @@ async def get_user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
     return user
 
 
+REQUIRED_FIELDS = ("first_name", "last_name", "email")
+
+
+def _profile_values(data: UserProfileUpdateRequest) -> dict[str, object]:
+    """Fields sent, ready for the model; names and email cannot be cleared."""
+    values = data.model_dump(exclude_unset=True)
+    as_json = data.model_dump(mode="json", exclude_unset=True)
+    if "social_links" in values:
+        values["social_links"] = as_json["social_links"]
+    return {k: v for k, v in values.items() if not (k in REQUIRED_FIELDS and v is None)}
+
+
 async def update_profile(
     db: AsyncSession, user: User, data: UserProfileUpdateRequest
 ) -> User:
-    for key, value in data.model_dump(exclude_unset=True, exclude_none=True).items():
+    for key, value in _profile_values(data).items():
         setattr(user, key, value)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def ict_track(db: AsyncSession, user: User) -> str | None:
+    """The user's ICT track in their active cohort, or their latest one."""
+    stmt = select(CohortEnrollment.ict_track).where(
+        CohortEnrollment.user_id == user.id, CohortEnrollment.ict_track.is_not(None)
+    )
+    if user.active_cohort_id is not None:
+        stmt = stmt.where(CohortEnrollment.cohort_id == user.active_cohort_id)
+    return await db.scalar(stmt.order_by(CohortEnrollment.enrolled_at.desc()).limit(1))
+
+
+async def profile(db: AsyncSession, user: User) -> UserProfileResponse:
+    return UserProfileResponse.model_validate(user).model_copy(
+        update={"ict_track": await ict_track(db, user)}
+    )
+
+
+async def my_cohorts(db: AsyncSession, user: User) -> list[MyCohort]:
+    roles: dict[uuid.UUID, list[UserRole]] = {}
+    for assignment in user.roles:
+        if assignment.cohort_id is not None:
+            roles.setdefault(assignment.cohort_id, []).append(assignment.role)
+    cohorts = await db.scalars(
+        select(Cohort).where(Cohort.id.in_(roles)).order_by(Cohort.start_date.desc())
+    )
+    return [
+        MyCohort(
+            cohort=CohortBrief.model_validate(c),
+            roles=sorted(roles[c.id]),
+            is_active_context=c.id == user.active_cohort_id,
+        )
+        for c in cohorts
+    ]
+
+
+async def set_active_cohort(
+    db: AsyncSession, user: User, data: ActiveCohortRequest
+) -> User:
+    if not any(
+        r.role is data.role and r.cohort_id == data.cohort_id for r in user.roles
+    ):
+        raise BadRequest("You do not hold that role in that cohort")
+    user.active_cohort_id, user.active_role = data.cohort_id, data.role
     await db.commit()
     await db.refresh(user)
     return user
@@ -41,16 +112,21 @@ async def update_profile(
 async def admin_update_user(
     db: AsyncSession, user: User, data: AdminUserUpdateRequest, admin: User
 ) -> User:
-    changes: dict[str, dict[str, str]] = {}
-    for key, value in data.model_dump(exclude_unset=True, exclude_none=True).items():
+    changes: dict[str, dict[str, object]] = {}
+    as_json = data.model_dump(mode="json", exclude_unset=True)
+    for key, value in _profile_values(data).items():
         if key == "email":
-            value = value.lower()
+            value = str(value).lower()
             if value != user.email and await db.scalar(
                 select(User.id).where(User.email == value)
             ):
                 raise Conflict("A user with this email already exists")
         if getattr(user, key) != value:
-            changes[key] = {"old": getattr(user, key), "new": value}
+            old = getattr(user, key)
+            changes[key] = {
+                "old": old if isinstance(old, dict | str | None) else str(old),
+                "new": as_json[key] if key != "email" else value,
+            }
             setattr(user, key, value)
 
     if changes:

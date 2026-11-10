@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Path, Query, status
 
-from forge.api.deps import ActiveUser, AdminUser, DbSession
+from forge.api.deps import ActiveUser, DbSession, ManagerUser
 from forge.models import Cohort, CohortEnrollment
 from forge.schemas.cohort import (
     BulkEnrollmentRequest,
@@ -27,9 +27,10 @@ from forge.services import cohorts as cohort_service
 from forge.services import points as points_service
 from forge.services import sessions as session_service
 from forge.services.access import (
+    ensure_cohort_manager,
     ensure_cohort_member,
     ensure_cohort_staff,
-    get_cohort_or_404,
+    ensure_cohort_writable,
 )
 
 router = APIRouter(prefix="/cohorts", tags=["Cohorts"])
@@ -52,11 +53,22 @@ async def member_cohort(
 MemberCohort = Annotated[Cohort, Depends(member_cohort)]
 
 
-async def managed_cohort(cohort_id: UUID, _: AdminUser, db: DbSession) -> Cohort:
-    return await get_cohort_or_404(db, cohort_id)
+async def managed_cohort(cohort: VisibleCohort, user: ActiveUser) -> Cohort:
+    ensure_cohort_manager(user, cohort.id)
+    return cohort
 
 
 ManagedCohort = Annotated[Cohort, Depends(managed_cohort)]
+"""A cohort the caller manages: System Admin or Program Lead."""
+
+
+async def writable_cohort(cohort: ManagedCohort) -> Cohort:
+    ensure_cohort_writable(cohort)
+    return cohort
+
+
+WritableCohort = Annotated[Cohort, Depends(writable_cohort)]
+"""A managed cohort that is not completed or archived."""
 
 
 async def staffed_cohort(cohort: VisibleCohort, user: ActiveUser) -> Cohort:
@@ -69,14 +81,14 @@ StaffedCohort = Annotated[Cohort, Depends(staffed_cohort)]
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=CohortResponse)
 async def create_cohort(
-    data: CohortCreateRequest, admin: AdminUser, db: DbSession
+    data: CohortCreateRequest, user: ManagerUser, db: DbSession
 ) -> Cohort:
-    """Create a cohort. **Admin only.**
+    """Create a cohort. **System Admin or Program Lead.**
 
-    `skill_names` defaults to the six configured programme skills. KamiLimu month
-    boundaries, when omitted, fall back to calendar months from `start_date`.
+    KamiLimu month boundaries, when omitted, fall back to calendar months from
+    `start_date`. The points config and rating questions start from the defaults.
     """
-    return await cohort_service.create_cohort(db, data, admin)
+    return await cohort_service.create_cohort(db, data, user)
 
 
 @router.get("")
@@ -90,11 +102,13 @@ async def list_cohorts(
 
 @router.get("/{cohort_id}")
 async def get_cohort(cohort: VisibleCohort, db: DbSession) -> CohortDetailResponse:
-    """Cohort details with enrollment counts per role."""
+    """Cohort details: configuration, ICT tracks with their lead mentors, the
+    track selection window and enrollment counts per role."""
     counts = await cohort_service.enrollment_counts(db, cohort.id)
     return CohortDetailResponse.model_validate(
         {
             **CohortResponse.model_validate(cohort).model_dump(),
+            "ict_tracks": cohort.ict_tracks,
             "enrollment_counts": counts,
         }
     )
@@ -102,16 +116,10 @@ async def get_cohort(cohort: VisibleCohort, db: DbSession) -> CohortDetailRespon
 
 @router.patch("/{cohort_id}", response_model=CohortResponse)
 async def update_cohort(
-    data: CohortUpdateRequest, cohort: ManagedCohort, admin: AdminUser, db: DbSession
+    data: CohortUpdateRequest, cohort: WritableCohort, user: ActiveUser, db: DbSession
 ) -> Cohort:
-    """Update cohort settings. **Admin only.**"""
-    return await cohort_service.update_cohort(db, cohort, data, admin)
-
-
-@router.delete("/{cohort_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_cohort(cohort: ManagedCohort, admin: AdminUser, db: DbSession) -> None:
-    """Soft-delete a cohort; its data is retained but hidden from the API."""
-    await cohort_service.soft_delete_cohort(db, cohort, admin)
+    """Update cohort settings. **System Admin or Program Lead.**"""
+    return await cohort_service.update_cohort(db, cohort, data, user)
 
 
 @router.post(
@@ -120,22 +128,25 @@ async def delete_cohort(cohort: ManagedCohort, admin: AdminUser, db: DbSession) 
     response_model=EnrollmentResponse,
 )
 async def enroll_user(
-    data: EnrollmentRequest, cohort: ManagedCohort, admin: AdminUser, db: DbSession
+    data: EnrollmentRequest, cohort: WritableCohort, user: ActiveUser, db: DbSession
 ) -> CohortEnrollment:
     """Enroll a user in the cohort and grant the matching cohort-scoped role.
 
-    Mentees can be assigned a 1:1 `peer_mentor_id` (who must be enrolled as
-    `peer_mentor_1:1`) and an `ict_track` offered by the cohort.
+    No peer mentor or ICT track is needed: 1:1 peer mentors are assigned about a
+    month in, and mentees pick their ICT track during track selection.
     """
-    return await cohort_service.enroll(db, cohort, data, admin)
+    return await cohort_service.enroll(db, cohort, data, user)
 
 
 @router.post("/{cohort_id}/enrollments/bulk", status_code=status.HTTP_201_CREATED)
 async def bulk_enroll(
-    data: BulkEnrollmentRequest, cohort: ManagedCohort, admin: AdminUser, db: DbSession
+    data: BulkEnrollmentRequest,
+    cohort: WritableCohort,
+    user: ActiveUser,
+    db: DbSession,
 ) -> list[BulkEnrollmentResult]:
     """Enroll many users; failures are reported per user without aborting the batch."""
-    return await cohort_service.bulk_enroll(db, cohort, data.enrollments, admin)
+    return await cohort_service.bulk_enroll(db, cohort, data.enrollments, user)
 
 
 @router.get("/{cohort_id}/enrollments")
@@ -159,24 +170,25 @@ async def list_enrollments(
 async def update_enrollment(
     enrollment_id: UUID,
     data: EnrollmentUpdateRequest,
-    cohort: ManagedCohort,
-    admin: AdminUser,
+    cohort: WritableCohort,
+    user: ActiveUser,
     db: DbSession,
 ) -> CohortEnrollment:
-    """Change a mentee's peer mentor or ICT track. **Admin only.**"""
+    """Assign or change a mentee's 1:1 peer mentor, allowed from about a month
+    into the cohort. ICT tracks change only through track selection."""
     enrollment = await cohort_service.get_enrollment_or_404(db, cohort, enrollment_id)
-    return await cohort_service.update_enrollment(db, cohort, enrollment, data, admin)
+    return await cohort_service.update_enrollment(db, cohort, enrollment, data, user)
 
 
 @router.delete(
     "/{cohort_id}/enrollments/{enrollment_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def remove_enrollment(
-    enrollment_id: UUID, cohort: ManagedCohort, admin: AdminUser, db: DbSession
+    enrollment_id: UUID, cohort: WritableCohort, user: ActiveUser, db: DbSession
 ) -> None:
-    """Remove a user from the cohort and revoke the matching cohort-scoped role. **Admin only.**"""
+    """Remove a user from the cohort and revoke the matching cohort-scoped role."""
     enrollment = await cohort_service.get_enrollment_or_404(db, cohort, enrollment_id)
-    await cohort_service.remove_enrollment(db, enrollment, admin)
+    await cohort_service.remove_enrollment(db, enrollment, user)
 
 
 @router.get("/{cohort_id}/calendar")
@@ -202,6 +214,6 @@ async def get_calendar_month(
 async def graduation_report(
     cohort: StaffedCohort, db: DbSession
 ) -> GraduationReportResponse:
-    """Every mentee's points, rates and graduation status, lowest rate first.
-    **Committee of the cohort.**"""
+    """Every mentee's points and rates, ranked on the core rate, lowest first.
+    Graduation status is set once the cohort has graduated."""
     return await points_service.graduation_report(db, cohort)

@@ -1,6 +1,5 @@
-"""Leaderboard and competition schemas."""
+"""Competition schemas (Phase 2)."""
 
-import enum
 from datetime import date, datetime
 from typing import Self
 from uuid import UUID
@@ -9,57 +8,6 @@ from pydantic import Field, model_validator
 
 from forge.models import CompetitionStatus, CompetitionType, EntryStatus
 from forge.schemas.common import PageParams, RequestSchema, Schema, Title
-
-
-class LeaderboardDimension(enum.StrEnum):
-    CORE_ATTENDANCE = "core_attendance"
-    GRADUATION_RATE = "graduation_rate"
-    ACADEMIC = "academic"
-    EVENTS = "events"
-    OPPORTUNITIES = "opportunities"
-    CONSULTATIONS = "consultations"
-
-
-class LeaderboardRow(Schema):
-    rank: int
-    mentee_id: UUID | None = Field(
-        description="Hidden for other mentees when the leaderboard is anonymous"
-    )
-    display_name: str
-    is_me: bool
-    total_points: int
-    core_attendance: float
-    graduation_rate: float
-    academic: int
-    events: int
-    opportunities: int
-    consultations: int
-
-
-class LeaderboardResponse(Schema):
-    cohort_id: UUID
-    anonymous: bool
-    generated_at: datetime
-    entries: list[LeaderboardRow]
-
-
-class DimensionEntry(Schema):
-    rank: int
-    mentee_id: UUID | None
-    display_name: str
-    is_me: bool
-    value: float
-
-
-class DimensionRankingResponse(Schema):
-    cohort_id: UUID
-    dimension: LeaderboardDimension
-    anonymous: bool
-    entries: list[DimensionEntry]
-
-
-class LeaderboardSettings(RequestSchema):
-    leaderboard_anonymous: bool
 
 
 class CompetitionCreateRequest(RequestSchema):

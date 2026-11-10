@@ -14,6 +14,8 @@ from forge.core.config import settings
 class TokenType(StrEnum):
     ACCESS = "access"
     REFRESH = "refresh"
+    # Short-lived proof that the user just re-entered their password.
+    CONFIRMATION = "confirmation"
 
 
 class TokenError(Exception):
@@ -29,11 +31,15 @@ def create_token(
     """Create a JWT and return ``(token, jti, expires_at)``."""
     now = datetime.now(UTC)
     if expires_delta is None:
-        expires_delta = (
-            timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-            if token_type is TokenType.ACCESS
-            else timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-        )
+        match token_type:
+            case TokenType.ACCESS:
+                expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+            case TokenType.REFRESH:
+                expires_delta = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+            case TokenType.CONFIRMATION:
+                expires_delta = timedelta(
+                    minutes=settings.CONFIRMATION_TOKEN_EXPIRE_MINUTES
+                )
     expire = now + expires_delta
     jti = str(uuid.uuid4())
 

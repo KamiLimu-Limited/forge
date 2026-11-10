@@ -7,10 +7,10 @@ from fastapi import APIRouter, Query, status
 from fastapi.responses import Response
 from sqlalchemy import select
 
-from forge.api.deps import CommitteeUser, DbSession
-from forge.api.routes.cohorts import StaffedCohort
+from forge.api.deps import DbSession, StaffUser
+from forge.api.routes.cohorts import ManagedCohort, StaffedCohort
 from forge.core.exceptions import NotFound
-from forge.models import Cohort, CohortAnalyticsSnapshot
+from forge.models import Cohort, CohortAnalyticsSnapshot, LeaderboardKind
 from forge.schemas.analytics import (
     ActivityEngagementResponse,
     AttendanceTrendResponse,
@@ -54,7 +54,7 @@ async def track_performance(
 async def session_quality(
     cohort: StaffedCohort, db: DbSession
 ) -> SessionQualityResponse:
-    """Average feedback ratings per session."""
+    """Average of each of the nine rating questions, per session and cohort-wide."""
     return await analytics_service.session_quality(db, cohort)
 
 
@@ -62,7 +62,8 @@ async def session_quality(
 async def health_trajectory(
     cohort: StaffedCohort, db: DbSession
 ) -> HealthTrajectoryResponse:
-    """How many mentees were on track, warning or at risk at the end of each month."""
+    """Average core and overall rates, and how many mentees met the graduation
+    threshold on their core rate, at the end of each KamiLimu month."""
     return await analytics_service.health_trajectory(db, cohort)
 
 
@@ -70,7 +71,8 @@ async def health_trajectory(
 async def activity_engagement(
     cohort: StaffedCohort, db: DbSession
 ) -> ActivityEngagementResponse:
-    """Extra-activity volume, approvals and participation by type."""
+    """Extra-activity volume (active and reversed), points and participation for
+    each of the five log types."""
     return await analytics_service.activity_engagement(db, cohort)
 
 
@@ -78,9 +80,10 @@ async def activity_engagement(
     "/snapshots", status_code=status.HTTP_201_CREATED, response_model=SnapshotResponse
 )
 async def take_snapshot(
-    cohort: StaffedCohort, db: DbSession
+    cohort: ManagedCohort, db: DbSession
 ) -> CohortAnalyticsSnapshot:
-    """Store today's metrics now (a daily snapshot is also taken automatically)."""
+    """Store today's metrics now (a daily snapshot is also taken automatically).
+    **System Admin or Program Lead.**"""
     return await analytics_service.take_snapshot(db, cohort)
 
 
@@ -94,16 +97,12 @@ async def list_snapshots(
 
 @cross_router.get("/cross-cohort")
 async def cross_cohort(
-    user: CommitteeUser,
+    user: StaffUser,
     db: DbSession,
     cohort_ids: Annotated[list[UUID], Query(min_length=1, max_length=20)],
 ) -> CrossCohortResponse:
     """Compare health and engagement across cohorts you can manage."""
-    cohorts = list(
-        await db.scalars(
-            select(Cohort).where(Cohort.id.in_(cohort_ids), Cohort.deleted_at.is_(None))
-        )
-    )
+    cohorts = list(await db.scalars(select(Cohort).where(Cohort.id.in_(cohort_ids))))
     if len(cohorts) != len(set(cohort_ids)):
         raise NotFound("One or more cohorts not found")
     for cohort in cohorts:
@@ -117,12 +116,14 @@ async def cross_cohort(
     "/leaderboard/{cohort_id}", response_class=Response, responses=CSV_RESPONSE
 )
 async def export_leaderboard(
-    cohort: StaffedCohort, user: CommitteeUser, db: DbSession
+    cohort: StaffedCohort,
+    db: DbSession,
+    board: LeaderboardKind = LeaderboardKind.MENTEE,
 ) -> Response:
-    """The cohort leaderboard as CSV."""
+    """The cohort's mentee or peer mentor leaderboard as CSV."""
     return export_service.csv_response(
-        await leaderboard_service.leaderboard_csv(db, cohort, user),
-        f"leaderboard-{cohort.name}",
+        await leaderboard_service.leaderboard_csv(db, cohort, board),
+        f"leaderboard-{board.value}-{cohort.name}",
     )
 
 
@@ -130,7 +131,7 @@ async def export_leaderboard(
     "/attendance/{cohort_id}", response_class=Response, responses=CSV_RESPONSE
 )
 async def export_attendance(cohort: StaffedCohort, db: DbSession) -> Response:
-    """Every mentee × session outcome with feedback ratings."""
+    """Every mentee × session outcome with the nine ratings."""
     return export_service.csv_response(
         await export_service.attendance_csv(db, cohort), f"attendance-{cohort.name}"
     )
@@ -140,7 +141,8 @@ async def export_attendance(cohort: StaffedCohort, db: DbSession) -> Response:
     "/full-report/{cohort_id}", response_class=Response, responses=CSV_RESPONSE
 )
 async def export_full_report(cohort: StaffedCohort, db: DbSession) -> Response:
-    """One row per mentee: points, rates, graduation status and activities."""
+    """One row per mentee: points, core and overall rates, graduation status and
+    active activities."""
     return export_service.csv_response(
         await export_service.full_report_csv(db, cohort), f"report-{cohort.name}"
     )

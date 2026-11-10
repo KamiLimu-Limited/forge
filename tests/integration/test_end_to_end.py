@@ -55,7 +55,7 @@ async def test_invite_to_leaderboard(client: AsyncClient, admin_user, db_session
                 "cohort_id": cohort["id"],
                 "title": "Engines",
                 "starts_at": datetime.now(UTC).isoformat(),  # after Ada enrolled
-                "duration_minutes": 60,
+                "ends_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "category": "thursday",
                 "points": 20,
                 "status": "published",
@@ -73,7 +73,12 @@ async def test_invite_to_leaderboard(client: AsyncClient, admin_user, db_session
 
     submitted = await client.post(
         "/api/v1/attendance",
-        json={"session_id": session["id"], "quality_rating": 5, "usefulness_rating": 5},
+        json={
+            "session_id": session["id"],
+            "status": "present",
+            "ratings": [5] * 9,
+            "feedback": "Clear and practical",
+        },
         headers=ada_headers,
     )
     assert submitted.status_code == 201
@@ -94,7 +99,7 @@ async def test_invite_to_leaderboard(client: AsyncClient, admin_user, db_session
     ).json()
 
     assert points["total_points"] == 20
-    assert status["status"] == "on_track"
+    assert (status["status"], status["core_rate"]) == (None, 100.0)
     assert board["entries"][0] == board["entries"][0] | {
         "rank": 1,
         "is_me": True,
@@ -122,6 +127,7 @@ def test_default_jobs_registered():
 
     assert {
         "close_expired_windows",
+        "advance_statuses",
         "dispatch_pending_emails",
-        "send_graduation_warnings",
     } <= names
+    assert not {"send_graduation_warnings", "send_task_deadline_reminders"} & names

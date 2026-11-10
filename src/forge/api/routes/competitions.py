@@ -1,16 +1,16 @@
-"""Leaderboard and competition endpoints."""
+"""Competition endpoints.
+
+Phase 2: this router is not mounted; competition tracking is not part of launch.
+"""
 
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from fastapi.responses import Response
 
-from forge.api.deps import ActiveUser, CommitteeUser, DbSession
-from forge.api.routes.cohorts import MemberCohort, StaffedCohort
+from forge.api.deps import ActiveUser, DbSession, StaffUser
 from forge.api.routes.mentees import MenteeEnrollment
-from forge.models import Cohort, Competition, CompetitionEntry, CompetitionRound
-from forge.schemas.cohort import CohortResponse
+from forge.models import Competition, CompetitionEntry, CompetitionRound
 from forge.schemas.common import Page
 from forge.schemas.competition import (
     CompetitionCreateRequest,
@@ -18,22 +18,16 @@ from forge.schemas.competition import (
     CompetitionResponse,
     CompetitionStatusEntry,
     CompetitionUpdateRequest,
-    DimensionRankingResponse,
     EntriesCreateRequest,
     EntryResponse,
     EntryUpdateRequest,
-    LeaderboardDimension,
-    LeaderboardResponse,
-    LeaderboardSettings,
     RoundCreateRequest,
     RoundResponse,
     RoundUpdateRequest,
 )
 from forge.services import competitions as competition_service
-from forge.services import leaderboard as leaderboard_service
-from forge.services.exports import csv_response
 
-router = APIRouter(tags=["Leaderboard & Competitions"])
+router = APIRouter(tags=["Competitions"])
 
 
 async def visible_competition(
@@ -45,60 +39,13 @@ async def visible_competition(
 VisibleCompetition = Annotated[Competition, Depends(visible_competition)]
 
 
-@router.get("/cohorts/{cohort_id}/leaderboard")
-async def get_leaderboard(
-    cohort: MemberCohort, user: ActiveUser, db: DbSession
-) -> LeaderboardResponse:
-    """Mentees ranked by total points, with all six dimensions: core attendance,
-    graduation rate, academic, events, opportunities and consultations. When the
-    cohort's leaderboard is anonymous, other mentees' names are hidden from non-staff."""
-    return await leaderboard_service.leaderboard(db, cohort, user)
-
-
-@router.get(
-    "/cohorts/{cohort_id}/leaderboard/export",
-    response_class=Response,
-    responses={200: {"content": {"text/csv": {}}, "description": "Leaderboard as CSV"}},
-)
-async def export_leaderboard(
-    cohort: StaffedCohort, user: ActiveUser, db: DbSession
-) -> Response:
-    """Download the leaderboard as CSV. **Committee of the cohort.**"""
-    content = await leaderboard_service.leaderboard_csv(db, cohort, user)
-    return csv_response(content, f"leaderboard-{cohort.name}")
-
-
-@router.patch(
-    "/cohorts/{cohort_id}/leaderboard/settings", response_model=CohortResponse
-)
-async def update_leaderboard_settings(
-    data: LeaderboardSettings, cohort: StaffedCohort, db: DbSession
-) -> Cohort:
-    """Toggle leaderboard anonymity. **Committee of the cohort.**"""
-    cohort.leaderboard_anonymous = data.leaderboard_anonymous
-    await db.commit()
-    await db.refresh(cohort)
-    return cohort
-
-
-@router.get("/cohorts/{cohort_id}/leaderboard/{dimension}")
-async def get_dimension_ranking(
-    dimension: LeaderboardDimension,
-    cohort: MemberCohort,
-    user: ActiveUser,
-    db: DbSession,
-) -> DimensionRankingResponse:
-    """Ranking on a single dimension (ties share a rank)."""
-    return await leaderboard_service.dimension_ranking(db, cohort, user, dimension)
-
-
 @router.post(
     "/competitions",
     status_code=status.HTTP_201_CREATED,
     response_model=CompetitionResponse,
 )
 async def create_competition(
-    data: CompetitionCreateRequest, user: CommitteeUser, db: DbSession
+    data: CompetitionCreateRequest, user: StaffUser, db: DbSession
 ) -> Competition:
     """Create a competition (innovation, public speaking, scholarship, professional). **Committee.**"""
     return await competition_service.create_competition(db, user, data)
@@ -123,7 +70,7 @@ async def get_competition(competition: VisibleCompetition) -> Competition:
 async def update_competition(
     data: CompetitionUpdateRequest,
     competition: VisibleCompetition,
-    user: CommitteeUser,
+    user: StaffUser,
     db: DbSession,
 ) -> Competition:
     """Update a competition's details or status. **Committee.**"""
@@ -138,7 +85,7 @@ async def update_competition(
 async def create_round(
     data: RoundCreateRequest,
     competition: VisibleCompetition,
-    user: CommitteeUser,
+    user: StaffUser,
     db: DbSession,
 ) -> CompetitionRound:
     """Add a numbered round to a competition. **Committee.**"""
@@ -147,7 +94,7 @@ async def create_round(
 
 @router.patch("/rounds/{round_id}", response_model=RoundResponse)
 async def update_round(
-    round_id: UUID, data: RoundUpdateRequest, user: CommitteeUser, db: DbSession
+    round_id: UUID, data: RoundUpdateRequest, user: StaffUser, db: DbSession
 ) -> CompetitionRound:
     """Rename, reschedule or change a round's status. **Committee.**"""
     return await competition_service.update_round(db, user, round_id, data)
@@ -161,7 +108,7 @@ async def update_round(
 async def create_entries(
     data: EntriesCreateRequest,
     competition: VisibleCompetition,
-    user: CommitteeUser,
+    user: StaffUser,
     db: DbSession,
 ) -> list[CompetitionEntry]:
     """Register individual or team entries. All members must be mentees of the cohort."""
@@ -180,7 +127,7 @@ async def list_entries(
 
 @router.patch("/entries/{entry_id}", response_model=EntryResponse)
 async def update_entry(
-    entry_id: UUID, data: EntryUpdateRequest, user: CommitteeUser, db: DbSession
+    entry_id: UUID, data: EntryUpdateRequest, user: StaffUser, db: DbSession
 ) -> CompetitionEntry:
     """Advance, eliminate or record a result for an entry. **Committee.**"""
     return await competition_service.update_entry(db, user, entry_id, data)

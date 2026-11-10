@@ -9,6 +9,7 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["SECRET_KEY"] = "test-secret-key-that-is-at-least-32-bytes"
 os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["RESEND_API_KEY"] = ""
+os.environ["REFRESH_TOKEN_EXPIRE_DAYS"] = "30"
 
 import uuid  # noqa: E402
 from collections.abc import AsyncGenerator, Iterator  # noqa: E402
@@ -37,6 +38,7 @@ from forge.models import (  # noqa: E402
     AccountState,
     Cohort,
     CohortEnrollment,
+    CohortIctTrack,
     CohortStatus,
     Invitation,
     ProgrammeSession,
@@ -149,11 +151,11 @@ class Factory:
             "start_date": today - timedelta(days=60),
             "end_date": today + timedelta(days=240),
             "status": CohortStatus.ACTIVE,
-            "ict_tracks_offered": ["web", "data"],
-            "skill_names": ["communication", "leadership", "technical"],
-            "leaderboard_anonymous": False,
         }
+        tracks = overrides.pop("ict_tracks", ["web", "data"])
+        assert isinstance(tracks, list)
         cohort = Cohort(**(values | overrides))
+        cohort.ict_tracks = [CohortIctTrack(name=name) for name in tracks]
         self.db.add(cohort)
         await self.db.commit()
         return cohort
@@ -188,18 +190,20 @@ class Factory:
         starts_at: datetime | None = None,
         status: SessionStatus = SessionStatus.PUBLISHED,
         category: SessionCategory = SessionCategory.THURSDAY,
-        session_type: SessionType = SessionType.CORE,
+        session_type: SessionType = SessionType.THEORY,
         track: str | None = None,
         points: int = 10,
         kami_limu_month: int = 1,
         title: str = "Session",
+        ends_at: datetime | None = None,
     ) -> ProgrammeSession:
+        starts_at = starts_at or datetime.now(UTC) - timedelta(hours=3)
         session = ProgrammeSession(
             cohort_id=cohort.id,
             title=title,
             kami_limu_month=kami_limu_month,
-            starts_at=starts_at or datetime.now(UTC) - timedelta(hours=3),
-            duration_minutes=120,
+            starts_at=starts_at,
+            ends_at=ends_at or starts_at + timedelta(hours=2),
             category=category,
             session_type=session_type,
             track=track,
@@ -210,7 +214,7 @@ class Factory:
         )
         self.db.add(session)
         await self.db.flush()
-        if status is SessionStatus.PUBLISHED:
+        if status is not SessionStatus.DRAFT:
             await sync_window(self.db, session, cohort)
         await self.db.commit()
         return session
@@ -300,6 +304,7 @@ class Programme:
 
     cohort: Cohort
     admin: User
+    program_lead: User
     committee: User
     peer_mentor: User
     ict_mentor: User
@@ -311,6 +316,9 @@ class Programme:
 @pytest_asyncio.fixture
 async def programme(factory: Factory, admin_user: User) -> Programme:
     cohort = await factory.cohort()
+    program_lead = await factory.user(
+        "lead@test.com", UserRole.PROGRAM_LEAD, first_name="Lead"
+    )
     committee = await factory.user("committee@test.com", first_name="Comm")
     await factory.enroll(committee, cohort, UserRole.COMMITTEE)
     peer_mentor = await factory.user("peer@test.com", first_name="Peer")
@@ -336,6 +344,7 @@ async def programme(factory: Factory, admin_user: User) -> Programme:
     return Programme(
         cohort,
         admin_user,
+        program_lead,
         committee,
         peer_mentor,
         ict_mentor,

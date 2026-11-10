@@ -41,7 +41,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production-use-openssl-rand-hex-32"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=30, ge=30, le=90)
+    CONFIRMATION_TOKEN_EXPIRE_MINUTES: int = 5
     INVITATION_TOKEN_EXPIRE_DAYS: int = 7
     PASSWORD_RESET_TOKEN_EXPIRE_HOURS: int = 24
     # Fernet key for encrypting private notes at rest; derived from SECRET_KEY when empty.
@@ -71,34 +72,13 @@ class Settings(BaseSettings):
     SCHEDULER_INTERVAL_SECONDS: int = 300
     NOTIFICATION_MAX_ATTEMPTS: int = 5
     WINDOW_CLOSING_REMINDER_HOURS: int = 12
-    TASK_DEADLINE_REMINDER_HOURS: int = 24
 
     # Programme rules
     DEFAULT_GRADUATION_THRESHOLD: int = 80
-    GRADUATION_WARNING_MARGIN: int = 5
     DEFAULT_SESSION_POINTS: int = 10
-    THURSDAY_WINDOW_HOURS: int = 24
-    SATURDAY_WINDOW_HOURS: int = 48
-    PEER_MENTORSHIP_WINDOW_HOURS: int = 72
     OVERRIDE_EXTENSION_HOURS: int = 48
-    EXTRA_ACTIVITY_DEFAULT_POINTS: dict[str, int] = Field(
-        default_factory=lambda: {
-            "academic": 5,
-            "event": 5,
-            "opportunity": 5,
-            "consultation": 5,
-        }
-    )
-    DEFAULT_SKILL_NAMES: Annotated[
-        list[str], NoDecode, BeforeValidator(parse_csv_list)
-    ] = [
-        "communication",
-        "leadership",
-        "technical",
-        "teamwork",
-        "problem_solving",
-        "professionalism",
-    ]
+    # 1:1 peer mentors are assigned about a month into the cohort.
+    PEER_MENTOR_ASSIGNMENT_DELAY_DAYS: int = 28
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

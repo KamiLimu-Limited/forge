@@ -1,71 +1,124 @@
-"""Extra activity submission and committee validation."""
+"""Extra activity logging, points and reversal.
+
+Points are awarded when a log is submitted, using the cohort's points config, and
+recalculated whenever a job or scholarship application changes stage or a
+consultation is completed. A manager can reverse a log, which keeps the record
+and the reason but removes its points.
+"""
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from pydantic import ValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from forge.core.config import settings
 from forge.core.exceptions import BusinessRuleViolation, NotFound, PermissionDenied
 from forge.models import (
+    APPLICATION_TYPES,
     ActivityStatus,
     ActivityType,
+    Cohort,
     CohortEnrollment,
+    Consultant,
     ExtraActivity,
-    NotificationType,
     User,
     UserRole,
 )
+from forge.models.activity import ConsultationStatus, OpportunityStage
 from forge.schemas.activity import (
     DETAILS_MODELS,
     ActivityFilters,
+    ActivityProgressResponse,
     ActivityRequest,
-    ActivityReviewRequest,
     ActivityUpdateRequest,
-    ConsultationDetails,
+    ConsultationSessionRequest,
+    TypeProgress,
 )
-from forge.services.access import get_enrollment, is_cohort_staff
+from forge.schemas.cohort import PointsConfig
+from forge.services.access import (
+    ensure_cohort_manager,
+    ensure_cohort_writable,
+    get_cohort_or_404,
+    get_enrollment,
+    get_participant_enrollment,
+    get_participant_enrollment_or_404,
+    is_cohort_staff,
+)
 from forge.services.audit import log_action
-from forge.services.notifications import notify
+from forge.services.cohort_config import points_config
 from forge.services.pagination import paginate
 
+STAFF_ROLES = (
+    UserRole.PROGRAM_LEAD,
+    UserRole.COMMITTEE,
+    UserRole.PROGRAM_DELIVERY_LEAD,
+)
 
-async def _check_consultation_mentor(db: AsyncSession, details: object) -> None:
-    if (
-        isinstance(details, ConsultationDetails)
-        and details.mentor_id
-        and not await db.get(User, details.mentor_id)
-    ):
-        raise NotFound("Consultation mentor not found")
+
+def points_for(
+    activity_type: ActivityType, details: dict[str, object], config: PointsConfig
+) -> int:
+    if activity_type in APPLICATION_TYPES:
+        stages = getattr(config, activity_type.value)
+        return int(getattr(stages, str(details.get("stage", OpportunityStage.APPLIED))))
+    if activity_type is ActivityType.CONSULTATION:
+        completed = details.get("status") == ConsultationStatus.COMPLETED
+        return config.consultation if completed else 0
+    return int(getattr(config, activity_type.value))
+
+
+def _check_log_window(cohort: Cohort, when: date) -> None:
+    today = date.today()
+    if when > today:
+        raise BusinessRuleViolation("Activities can only be logged once they happen")
+    if today - when > timedelta(days=cohort.extra_log_window_days):
+        raise BusinessRuleViolation(
+            f"Activities must be logged within {cohort.extra_log_window_days} days"
+        )
+
+
+async def _check_consultant(db: AsyncSession, consultant_id: uuid.UUID) -> None:
+    consultant = await db.get(Consultant, consultant_id)
+    if consultant is None or not consultant.is_active:
+        raise NotFound("Consultant not found on the roster")
 
 
 async def submit_activity(
-    db: AsyncSession, mentee: User, activity_type: ActivityType, data: ActivityRequest
+    db: AsyncSession, user: User, activity_type: ActivityType, data: ActivityRequest
 ) -> ExtraActivity:
-    enrollment = await get_enrollment(db, mentee.id, data.cohort_id)
+    enrollment = await get_participant_enrollment(db, user.id, data.cohort_id)
     if enrollment is None:
-        raise PermissionDenied("You must be enrolled as a mentee to log activities")
-    await _check_consultation_mentor(db, data.details)
+        raise PermissionDenied("You must be enrolled as a mentee or peer mentor")
+    cohort = await get_cohort_or_404(db, enrollment.cohort_id)
+    ensure_cohort_writable(cohort)
+    _check_log_window(cohort, data.date)
+    consultant_id = None
+    if isinstance(data, ConsultationSessionRequest):
+        await _check_consultant(db, data.consultant_id)
+        consultant_id = data.consultant_id
 
+    details = data.details.model_dump(mode="json")
     activity = ExtraActivity(
         type=activity_type,
-        mentee_id=mentee.id,
-        cohort_id=enrollment.cohort_id,
+        mentee_id=user.id,
+        cohort_id=cohort.id,
         title=data.title,
         description=data.description,
         date=data.date,
-        details=data.details.model_dump(mode="json"),
+        details=details,
+        consultant_id=consultant_id,
+        points_awarded=points_for(activity_type, details, points_config(cohort)),
     )
     db.add(activity)
     await db.flush()
     log_action(
         db,
         "submit_extra_activity",
-        user_id=mentee.id,
+        user_id=user.id,
         resource_type="extra_activity",
         resource_id=activity.id,
+        points=activity.points_awarded,
     )
     await db.commit()
     await db.refresh(activity)
@@ -100,10 +153,8 @@ async def list_activities(
     if mine:
         stmt = stmt.where(ExtraActivity.mentee_id == user.id)
     elif not user.is_admin:
-        committee_scopes = {
-            r.cohort_id for r in user.roles if r.role is UserRole.COMMITTEE
-        }
-        if None not in committee_scopes:
+        staff_scopes = {r.cohort_id for r in user.roles if r.role in STAFF_ROLES}
+        if None not in staff_scopes:
             group = select(CohortEnrollment.user_id).where(
                 CohortEnrollment.peer_mentor_id == user.id
             )
@@ -111,7 +162,7 @@ async def list_activities(
                 or_(
                     ExtraActivity.mentee_id == user.id,
                     ExtraActivity.mentee_id.in_(group),
-                    ExtraActivity.cohort_id.in_(committee_scopes),
+                    ExtraActivity.cohort_id.in_(staff_scopes),
                 )
             )
     for name in ("cohort_id", "type", "status", "mentee_id"):
@@ -123,12 +174,21 @@ async def list_activities(
 async def update_activity(
     db: AsyncSession, user: User, activity: ExtraActivity, data: ActivityUpdateRequest
 ) -> ExtraActivity:
+    """Edit your own active log; stage, outcome and status changes recalculate points."""
     if activity.mentee_id != user.id:
         raise PermissionDenied("You can only edit your own activities")
-    if activity.status is not ActivityStatus.PENDING:
-        raise BusinessRuleViolation("Only pending activities can be edited")
+    if activity.status is ActivityStatus.REVERSED:
+        raise BusinessRuleViolation("Reversed activities cannot be edited")
+    cohort = await get_cohort_or_404(db, activity.cohort_id)
+    ensure_cohort_writable(cohort)
 
     values = data.model_dump(exclude_unset=True, exclude={"details"})
+    if "date" in values:
+        _check_log_window(cohort, values["date"])
+    if "consultant_id" in values:
+        if activity.type is not ActivityType.CONSULTATION:
+            raise BusinessRuleViolation("Only consultations have a consultant")
+        await _check_consultant(db, values["consultant_id"])
     if data.details is not None:
         try:
             details = DETAILS_MODELS[activity.type].model_validate(
@@ -136,72 +196,87 @@ async def update_activity(
             )
         except ValidationError as e:
             raise BusinessRuleViolation(
-                f"Invalid details for a {activity.type.value} activity: {e.errors()[0]['msg']}"
+                f"Invalid details for a {activity.type.value} activity: "
+                f"{e.errors()[0]['msg']}"
             ) from e
-        await _check_consultation_mentor(db, details)
         values["details"] = details.model_dump(mode="json")
     for key, value in values.items():
         setattr(activity, key, value)
+    previous = activity.points_awarded
+    activity.points_awarded = points_for(
+        activity.type, activity.details, points_config(cohort)
+    )
     log_action(
         db,
         "update_extra_activity",
         user_id=user.id,
         resource_type="extra_activity",
         resource_id=activity.id,
+        fields=sorted(values),
+        old_points=previous,
+        new_points=activity.points_awarded,
     )
     await db.commit()
     await db.refresh(activity)
     return activity
 
 
-async def review_activity(
-    db: AsyncSession,
-    reviewer: User,
-    activity: ExtraActivity,
-    data: ActivityReviewRequest,
-    approve: bool,
+async def reverse_activity(
+    db: AsyncSession, actor: User, activity: ExtraActivity, reason: str
 ) -> ExtraActivity:
-    """Approve (awarding points, which immediately count towards graduation) or reject."""
-    if not is_cohort_staff(reviewer, activity.cohort_id):
-        raise PermissionDenied("Requires committee access to this cohort")
-    if activity.status is not ActivityStatus.PENDING:
-        raise BusinessRuleViolation(
-            f"Activity has already been {activity.status.value}"
-        )
-
-    activity.status = ActivityStatus.APPROVED if approve else ActivityStatus.REJECTED
-    if approve:
-        default = settings.EXTRA_ACTIVITY_DEFAULT_POINTS.get(activity.type.value, 0)
-        activity.points_awarded = (
-            default if data.points_awarded is None else data.points_awarded
-        )
-    activity.reviewed_by = reviewer.id
-    activity.reviewed_at = datetime.now(UTC)
-    activity.review_reason = data.reason
-
-    notify(
-        db,
-        [activity.mentee_id],
-        NotificationType.ACTIVITY_APPROVED
-        if approve
-        else NotificationType.ACTIVITY_REJECTED,
-        {
-            "title": activity.title,
-            "type": activity.type.value,
-            "points": activity.points_awarded,
-            "reason": data.reason or "",
-        },
-        resource_type="extra_activity",
-        resource_id=activity.id,
-    )
+    """Take back an activity's points, keeping the record and the reason."""
+    ensure_cohort_manager(actor, activity.cohort_id)
+    if activity.status is ActivityStatus.REVERSED:
+        raise BusinessRuleViolation("Activity has already been reversed")
+    previous = activity.points_awarded
+    activity.status = ActivityStatus.REVERSED
+    activity.points_awarded = 0
+    activity.reversed_by = actor.id
+    activity.reversed_at = datetime.now(UTC)
+    activity.reversal_reason = reason
     log_action(
         db,
-        "approve_extra_activity" if approve else "reject_extra_activity",
-        user_id=reviewer.id,
+        "reverse_extra_activity",
+        user_id=actor.id,
         resource_type="extra_activity",
         resource_id=activity.id,
-        points=activity.points_awarded,
+        points_removed=previous,
+        reason=reason,
     )
     await db.commit()
     await db.refresh(activity)
     return activity
+
+
+async def progress(
+    db: AsyncSession, user: User, cohort_id: uuid.UUID | None
+) -> ActivityProgressResponse:
+    enrollment = await get_participant_enrollment_or_404(db, user.id, cohort_id)
+    cohort = await get_cohort_or_404(db, enrollment.cohort_id)
+    config = points_config(cohort)
+    rows = await db.execute(
+        select(
+            ExtraActivity.type,
+            func.count(),
+            func.coalesce(func.sum(ExtraActivity.points_awarded), 0),
+        )
+        .where(
+            ExtraActivity.cohort_id == cohort.id,
+            ExtraActivity.mentee_id == user.id,
+            ExtraActivity.status == ActivityStatus.ACTIVE,
+        )
+        .group_by(ExtraActivity.type)
+    )
+    logged = {t: (count, int(points)) for t, count, points in rows}
+    return ActivityProgressResponse(
+        cohort_id=cohort.id,
+        types=[
+            TypeProgress(
+                type=t,
+                logged=logged.get(t, (0, 0))[0],
+                target=config.targets.get(t, 0),
+                points=logged.get(t, (0, 0))[1],
+            )
+            for t in ActivityType
+        ],
+    )

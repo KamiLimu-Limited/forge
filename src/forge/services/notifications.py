@@ -7,12 +7,13 @@ from datetime import UTC, datetime, timedelta
 from string import Template
 from typing import Any
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.core.config import settings
 from forge.core.exceptions import NotFound
 from forge.models import (
+    PARTICIPANT_ROLES,
     AttendanceRecord,
     AttendanceWindow,
     CohortEnrollment,
@@ -20,13 +21,12 @@ from forge.models import (
     Notification,
     NotificationType,
     ProgrammeSession,
-    SessionStatus,
     User,
     UserRole,
     UserRoleAssignment,
 )
 from forge.schemas.notification import BroadcastRequest, NotificationFilters
-from forge.services.eligibility import eligible_mentee_ids
+from forge.services.eligibility import COUNTED_STATUSES, eligible_mentee_ids
 from forge.services.email import render_email, send_email
 from forge.services.pagination import paginate
 
@@ -36,9 +36,21 @@ T = NotificationType
 
 # type -> (title, message) templates using ``$placeholders``.
 TEMPLATES: dict[NotificationType, tuple[str, str]] = {
-    T.SESSION_PUBLISHED: (
-        "New session: $title",
-        'A new session "$title" has been scheduled for $starts_at.',
+    T.INVITATION: (
+        "Welcome to $cohort",
+        "You have been invited to $cohort. Activate your account to get started.",
+    ),
+    T.PASSWORD_RESET: (
+        "Reset your password",
+        "A password reset was requested for your account.",
+    ),
+    T.WINDOW_OPENS: (
+        "Attendance open: $title",
+        'You can now record your attendance for "$title" until $closes_at.',
+    ),
+    T.WINDOW_CLOSING_SOON: (
+        "Attendance closing soon: $title",
+        'The attendance window for "$title" closes at $closes_at. Submit before then.',
     ),
     T.SESSION_RESCHEDULED: (
         "Session rescheduled: $title",
@@ -48,53 +60,17 @@ TEMPLATES: dict[NotificationType, tuple[str, str]] = {
         "Session cancelled: $title",
         '"$title" scheduled for $starts_at has been cancelled. $reason',
     ),
-    T.WINDOW_OPENING: (
-        "Attendance open: $title",
-        'You can now record your attendance for "$title" until $closes_at.',
-    ),
-    T.WINDOW_CLOSING_SOON: (
-        "Attendance closing soon: $title",
-        'The attendance window for "$title" closes at $closes_at. Submit before then.',
-    ),
-    T.GRADUATION_WARNING: (
-        "Your attendance needs attention",
-        "Your combined attendance is $rate%, close to the $threshold% graduation threshold.",
-    ),
-    T.GRADUATION_AT_RISK: (
-        "You are at risk of not graduating",
-        "Your combined attendance is $rate%, below the $threshold% graduation threshold.",
-    ),
     T.OVERRIDE_SUBMITTED: (
-        "Override request submitted",
-        '$mentee requested an attendance override for "$title": $reason',
+        "Window extension requested",
+        '$mentee asked to reopen attendance for "$title": $reason',
     ),
     T.OVERRIDE_APPROVED: (
-        "Override request approved",
-        'Your override request for "$title" was approved. You can submit until $closes_at.',
+        "Window extension approved",
+        'Your request for "$title" was approved. You can submit until $closes_at.',
     ),
     T.OVERRIDE_DENIED: (
-        "Override request denied",
-        'Your override request for "$title" was denied. $reason',
-    ),
-    T.ACTIVITY_APPROVED: (
-        "Activity approved: $title",
-        'Your $type activity "$title" was approved and earned $points points.',
-    ),
-    T.ACTIVITY_REJECTED: (
-        "Activity rejected: $title",
-        'Your $type activity "$title" was not approved. $reason',
-    ),
-    T.TASK_LAUNCHED: (
-        "New task: $title",
-        'Your peer mentor launched "$title". Deadline: $deadline.',
-    ),
-    T.TASK_DEADLINE_REMINDER: (
-        "Task due soon: $title",
-        '"$title" is due at $deadline. Mark it complete once you\'re done.',
-    ),
-    T.COHORT_INVITATION: (
-        "Welcome to $cohort",
-        "You have been added to $cohort. Check your calendar for upcoming sessions.",
+        "Window extension denied",
+        'Your request for "$title" was denied. $reason',
     ),
     T.BROADCAST: ("$title", "$message"),
 }
@@ -155,6 +131,23 @@ async def cohort_member_ids(
     if roles is not None:
         stmt = stmt.where(CohortEnrollment.role.in_(list(roles)))
     return list(await db.scalars(stmt))
+
+
+async def cohort_manager_ids(db: AsyncSession, cohort_id: uuid.UUID) -> list[uuid.UUID]:
+    """System Admins, plus Program Leads who are global or scoped to the cohort."""
+    stmt = select(UserRoleAssignment.user_id).where(
+        or_(
+            UserRoleAssignment.role == UserRole.ADMIN,
+            and_(
+                UserRoleAssignment.role == UserRole.PROGRAM_LEAD,
+                or_(
+                    UserRoleAssignment.cohort_id.is_(None),
+                    UserRoleAssignment.cohort_id == cohort_id,
+                ),
+            ),
+        )
+    )
+    return list(await db.scalars(stmt.distinct()))
 
 
 async def list_for_user(
@@ -278,7 +271,7 @@ async def dispatch_pending_emails(db: AsyncSession, batch_size: int = 100) -> in
 
 
 async def send_window_closing_reminders(db: AsyncSession) -> int:
-    """Remind mentees without a submission that a window closes soon (once per session)."""
+    """Remind participants without a submission that a window closes soon (once per session)."""
     now = datetime.now(UTC)
     soon = now + timedelta(hours=settings.WINDOW_CLOSING_REMINDER_HOURS)
     windows = await db.scalars(
@@ -288,7 +281,7 @@ async def send_window_closing_reminders(db: AsyncSession) -> int:
             AttendanceWindow.is_active.is_(True),
             AttendanceWindow.closes_at > now,
             AttendanceWindow.closes_at <= soon,
-            ProgrammeSession.status == SessionStatus.PUBLISHED,
+            ProgrammeSession.status.in_(COUNTED_STATUSES),
         )
     )
     total = 0
@@ -307,7 +300,7 @@ async def send_window_closing_reminders(db: AsyncSession) -> int:
             await db.scalars(
                 select(CohortEnrollment.user_id).where(
                     CohortEnrollment.cohort_id == window.session.cohort_id,
-                    CohortEnrollment.role == UserRole.MENTEE,
+                    CohortEnrollment.role.in_(PARTICIPANT_ROLES),
                     ~already_reminded,
                     ~submitted,
                 )

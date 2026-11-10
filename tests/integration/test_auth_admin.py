@@ -13,11 +13,11 @@ from forge.models import CohortEnrollment, Invitation, User
 from tests.conftest import Factory, auth_header, token_for
 
 CSV = (
-    "email,first_name,last_name,roles\n"
-    "a@test.com,Ann,One,mentee\n"
-    "b@test.com,Ben,Two,peer_mentor_1:1;alumni\n"
-    "not-an-email,Bad,Row,mentee\n"
-    "c@test.com,Cat,Three,wizard\n"
+    "email,first_name,last_name,roles,university,degree_level,github\n"
+    "a@test.com,Ann,One,mentee,University of Nairobi,bachelors,https://github.com/ann\n"
+    "b@test.com,Ben,Two,peer_mentor_1_1;alumni,,,\n"
+    "not-an-email,Bad,Row,mentee,,,\n"
+    "c@test.com,Cat,Three,partner,,,\n"
 )
 
 
@@ -38,6 +38,58 @@ async def test_bulk_invite_csv(client: AsyncClient, admin_user, factory: Factory
         "a@test.com",
         "b@test.com",
     }
+
+
+async def test_bulk_invite_csv_rejects_track_and_mentor_columns(
+    client: AsyncClient, admin_user
+):
+    response = await client.post(
+        "/api/v1/auth/bulk-invite/csv",
+        files={
+            "file": (
+                "users.csv",
+                "email,first_name,last_name,roles,ict_track\na@test.com,A,B,mentee,web\n",
+                "text/csv",
+            )
+        },
+        headers=token_for(admin_user),
+    )
+
+    assert response.status_code == 400
+    assert "ict_track" in response.json()["detail"]
+
+
+async def test_bulk_invite_profile_applied_on_activation(
+    client: AsyncClient, admin_user, db_session
+):
+    users = [
+        {
+            "email": "profiled@test.com",
+            "first_name": "Pro",
+            "last_name": "File",
+            "roles": ["mentee"],
+            "university": "JKUAT",
+            "gender": "female",
+            "social_links": {"linkedin": "https://linkedin.com/in/pro"},
+        }
+    ]
+    await client.post(
+        "/api/v1/auth/bulk-invite", json={"users": users}, headers=token_for(admin_user)
+    )
+    token = await db_session.scalar(
+        select(Invitation.token).where(Invitation.email == "profiled@test.com")
+    )
+    activated = await client.post(
+        "/api/v1/auth/activate", json={"token": token, "password": "Str0ngPass"}
+    )
+    me = (
+        await client.get(
+            "/api/v1/users/me", headers=auth_header(activated.json()["access_token"])
+        )
+    ).json()
+
+    assert (me["university"], me["gender"]) == ("JKUAT", "female")
+    assert me["social_links"]["linkedin"] == "https://linkedin.com/in/pro"
 
 
 async def test_bulk_invite_csv_rejects_bad_header(client: AsyncClient, admin_user):

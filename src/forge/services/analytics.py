@@ -3,11 +3,9 @@
 import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime
-from decimal import Decimal
 from statistics import fmean
-from typing import Any
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +13,6 @@ from forge.models import (
     ActivityStatus,
     ActivityType,
     AttendanceRecord,
-    AttendanceStatus,
     Cohort,
     CohortAnalyticsSnapshot,
     CohortStatus,
@@ -23,6 +20,7 @@ from forge.models import (
     OverrideRequest,
     OverrideRequestStatus,
     ProgrammeSession,
+    SessionStatus,
 )
 from forge.schemas.analytics import (
     ActivityEngagement,
@@ -39,7 +37,8 @@ from forge.schemas.analytics import (
     TrackPerformanceResponse,
     TrendPoint,
 )
-from forge.schemas.points import GraduationStatus
+from forge.schemas.points import SessionOutcome
+from forge.services import ratings
 from forge.services.cohorts import month_for
 from forge.services.eligibility import COUNTED_STATUSES
 from forge.services.points import (
@@ -51,16 +50,6 @@ from forge.services.points import (
     percent,
     tally,
 )
-
-
-def _status_counts(
-    stats: list[MenteeStats], cohort: Cohort
-) -> dict[GraduationStatus, int]:
-    final = cohort.status is CohortStatus.COMPLETED
-    counts = dict.fromkeys(GraduationStatus, 0)
-    for s in stats:
-        counts[s.graduation_status(cohort.graduation_threshold, final)] += 1
-    return counts
 
 
 async def _all_stats(db: AsyncSession, cohort: Cohort) -> list[MenteeStats]:
@@ -81,23 +70,32 @@ async def cohort_health(db: AsyncSession, cohort: Cohort) -> CohortHealthRespons
             OverrideRequest.status == OverrideRequestStatus.PENDING,
         )
     )
-    pending_activities = await db.scalar(
-        select(func.count()).where(
-            ExtraActivity.cohort_id == cohort.id,
-            ExtraActivity.status == ActivityStatus.PENDING,
-        )
+    sessions = dict(
+        (
+            await db.execute(
+                select(ProgrammeSession.status, func.count())
+                .where(
+                    ProgrammeSession.cohort_id == cohort.id,
+                    ProgrammeSession.status.in_(COUNTED_STATUSES),
+                )
+                .group_by(ProgrammeSession.status)
+            )
+        ).all()
     )
     return CohortHealthResponse(
         cohort_id=cohort.id,
         total_mentees=len(stats),
-        counts=_status_counts(stats, cohort),
-        average_core_rate=round(fmean(s.core_rate for s in stats), 2) if stats else 0.0,
-        average_combined_rate=round(fmean(s.combined_rate for s in stats), 2)
-        if stats
-        else 0.0,
+        average_core_rate=_mean([s.core_rate for s in stats]),
+        average_overall_rate=_mean([s.overall_rate for s in stats]),
+        points_distributed=sum(s.total_points for s in stats),
+        sessions_completed=sessions.get(SessionStatus.COMPLETED, 0),
+        sessions_scheduled=sum(sessions.values()),
         pending_override_requests=pending_overrides or 0,
-        pending_activities=pending_activities or 0,
     )
+
+
+def _mean(values: list[float]) -> float:
+    return round(fmean(values), 2) if values else 0.0
 
 
 async def attendance_trends(
@@ -111,7 +109,8 @@ async def attendance_trends(
             m = months[month]
             m.earned, m.available = m.earned + t.earned, m.available + t.available
         for entry in s.sessions:
-            sessions[entry.kami_limu_month].add(entry.session_id)
+            if entry.outcome is not SessionOutcome.REMAINING:
+                sessions[entry.kami_limu_month].add(entry.session_id)
     return AttendanceTrendResponse(
         cohort_id=cohort.id,
         months=[
@@ -150,85 +149,63 @@ async def track_performance(
     )
 
 
-def _avg(column: Any) -> ColumnElement[Decimal | None]:
-    return func.round(func.avg(column), 2)
-
-
 async def session_quality(db: AsyncSession, cohort: Cohort) -> SessionQualityResponse:
-    attended = (AttendanceRecord.session_id == ProgrammeSession.id) & (
-        AttendanceRecord.status == AttendanceStatus.ATTENDED
-    )
-    rows = await db.execute(
-        select(
-            ProgrammeSession.id,
-            ProgrammeSession.title,
-            ProgrammeSession.starts_at,
-            ProgrammeSession.kami_limu_month,
-            func.count(AttendanceRecord.id),
-            _avg(AttendanceRecord.quality_rating),
-            _avg(AttendanceRecord.usefulness_rating),
-            _avg(AttendanceRecord.understanding_score),
-            _avg(AttendanceRecord.academic_application_score),
-            _avg(AttendanceRecord.career_application_score),
-        )
-        .outerjoin(AttendanceRecord, attended)
-        .where(
-            ProgrammeSession.cohort_id == cohort.id,
-            ProgrammeSession.status.in_(COUNTED_STATUSES),
-        )
-        .group_by(ProgrammeSession.id)
-        .order_by(ProgrammeSession.starts_at)
-    )
-    sessions = [
-        SessionQuality(
-            session_id=sid,
-            title=title,
-            starts_at=starts_at,
-            kami_limu_month=month,
-            responses=responses,
-            quality=_float(q),
-            usefulness=_float(u),
-            understanding=_float(un),
-            academic_application=_float(a),
-            career_application=_float(c),
-        )
-        for sid, title, starts_at, month, responses, q, u, un, a, c in rows
-    ]
-    overall = (
-        await db.execute(
-            select(
-                _avg(AttendanceRecord.quality_rating),
-                _avg(AttendanceRecord.usefulness_rating),
+    sessions = list(
+        await db.scalars(
+            select(ProgrammeSession)
+            .where(
+                ProgrammeSession.cohort_id == cohort.id,
+                ProgrammeSession.status.in_(COUNTED_STATUSES),
             )
-            .join(ProgrammeSession, attended)
-            .where(ProgrammeSession.cohort_id == cohort.id)
+            .order_by(ProgrammeSession.starts_at)
         )
-    ).one()
+    )
+    by_session = await ratings.averages_by_session(db, [s.id for s in sessions])
+    empty: ratings.Averages = [None] * len(ratings.QUESTION_NUMBERS)
+    entries = []
+    for session in sessions:
+        responses, values = by_session.get(session.id, (0, empty))
+        entries.append(
+            SessionQuality(
+                session_id=session.id,
+                title=session.title,
+                starts_at=session.starts_at,
+                kami_limu_month=session.kami_limu_month,
+                responses=responses,
+                average=ratings.overall(values),
+                questions=ratings.describe(values, cohort),
+            )
+        )
+    _, values = await ratings.averages(
+        db,
+        AttendanceRecord.session_id.in_(
+            select(ProgrammeSession.id).where(ProgrammeSession.cohort_id == cohort.id)
+        ),
+    )
     return SessionQualityResponse(
         cohort_id=cohort.id,
-        overall_quality=_float(overall[0]),
-        overall_usefulness=_float(overall[1]),
-        sessions=sessions,
+        overall_average=ratings.overall(values),
+        questions=ratings.describe(values, cohort),
+        sessions=entries,
     )
-
-
-def _float(value: Decimal | None) -> float | None:
-    return float(value) if value is not None else None
 
 
 async def health_trajectory(
     db: AsyncSession, cohort: Cohort
 ) -> HealthTrajectoryResponse:
-    """Cohort status distribution as it stood at the end of each KamiLimu month."""
+    """Average rates, and how many mentees met the graduation threshold on their
+    core rate, as things stood at the end of each KamiLimu month."""
     now = datetime.now(UTC)
     mentee_ids = [e.user_id for e in await mentee_enrollments(db, cohort.id)]
-    rows = await load_rows(db, cohort.id, mentee_ids, now)
+    rows = [
+        r for r in await load_rows(db, cohort.id, mentee_ids, now) if r.starts_at <= now
+    ]
     activities = await db.execute(
         select(
             ExtraActivity.mentee_id, ExtraActivity.date, ExtraActivity.points_awarded
         ).where(
             ExtraActivity.cohort_id == cohort.id,
-            ExtraActivity.status == ActivityStatus.APPROVED,
+            ExtraActivity.status == ActivityStatus.ACTIVE,
         )
     )
     extra_by_month = [
@@ -248,16 +225,14 @@ async def health_trajectory(
         for mentee_id in mentee_ids:
             stats.setdefault(mentee_id, MenteeStats(mentee_id, cohort.id))
         values = list(stats.values())
-        counts = dict.fromkeys(GraduationStatus, 0)
-        for s in values:
-            counts[s.graduation_status(cohort.graduation_threshold, final=False)] += 1
+        meeting = sum(s.meets_threshold(cohort.graduation_threshold) for s in values)
         points.append(
             HealthPoint(
                 month=month,
-                average_rate=round(fmean(s.combined_rate for s in values), 2)
-                if values
-                else 0.0,
-                counts=counts,
+                average_core_rate=_mean([s.core_rate for s in values]),
+                average_overall_rate=_mean([s.overall_rate for s in values]),
+                meeting_threshold=meeting,
+                below_threshold=len(values) - meeting,
             )
         )
     return HealthTrajectoryResponse(cohort_id=cohort.id, months=points)
@@ -310,7 +285,7 @@ async def cross_cohort(db: AsyncSession, cohorts: list[Cohort]) -> CrossCohortRe
         approved = await db.scalar(
             select(func.count()).where(
                 ExtraActivity.cohort_id == cohort.id,
-                ExtraActivity.status == ActivityStatus.APPROVED,
+                ExtraActivity.status == ActivityStatus.ACTIVE,
             )
         )
         comparisons.append(
@@ -385,7 +360,6 @@ async def snapshot_active_cohorts(db: AsyncSession) -> int:
         await db.scalars(
             select(Cohort).where(
                 Cohort.status == CohortStatus.ACTIVE,
-                Cohort.deleted_at.is_(None),
                 Cohort.id.not_in(already),
             )
         )

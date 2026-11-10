@@ -2,7 +2,7 @@
 
 import enum
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import ForeignKey, String, Text, UniqueConstraint
@@ -28,23 +28,24 @@ class SessionCategory(enum.StrEnum):
 
 
 class SessionType(enum.StrEnum):
-    CORE = "core"
-    ICT = "ict"
-    PROFESSIONAL = "professional"
-    PEER_MENTORSHIP = "peer_mentorship"
+    THEORY = "theory"
+    TELL_AND_SHOW = "tell_and_show"
+    HANDS_ON = "hands_on"
+    SIMULATION = "simulation"
 
 
 class SessionMode(enum.StrEnum):
     PHYSICAL = "physical"
     VIRTUAL = "virtual"
-    HYBRID = "hybrid"
 
 
 class SessionStatus(enum.StrEnum):
     DRAFT = "draft"
     PUBLISHED = "published"
-    CANCELLED = "cancelled"
+    LIVE = "live"
     COMPLETED = "completed"
+    RESCHEDULED = "rescheduled"
+    CANCELLED = "cancelled"
 
 
 class MentorRole(enum.StrEnum):
@@ -70,9 +71,11 @@ class ProgrammeSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(Text)
     kami_limu_month: Mapped[int]
     starts_at: Mapped[datetime] = mapped_column(index=True)
-    duration_minutes: Mapped[int]
+    # For peer mentorship sessions (tasks) this is the submission deadline.
+    ends_at: Mapped[datetime]
     category: Mapped[SessionCategory] = mapped_column(pg_enum(SessionCategory))
     session_type: Mapped[SessionType] = mapped_column(pg_enum(SessionType))
+    # The ICT track a session belongs to; core sessions have none.
     track: Mapped[str | None] = mapped_column(String(100))
     mode: Mapped[SessionMode] = mapped_column(
         pg_enum(SessionMode), default=SessionMode.PHYSICAL
@@ -82,8 +85,6 @@ class ProgrammeSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     status: Mapped[SessionStatus] = mapped_column(
         pg_enum(SessionStatus), default=SessionStatus.DRAFT
     )
-    # Explicit deadline for peer mentorship attendance; overrides the default window.
-    attendance_deadline: Mapped[datetime | None]
     original_starts_at: Mapped[datetime | None]
     reschedule_history: Mapped[list[dict[str, Any]] | None]
     created_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -99,10 +100,6 @@ class ProgrammeSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     attendance_window: Mapped["AttendanceWindow | None"] = relationship(
         lazy="selectin", viewonly=True
     )
-
-    @property
-    def ends_at(self) -> datetime:
-        return self.starts_at + timedelta(minutes=self.duration_minutes)
 
 
 class SessionMentor(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

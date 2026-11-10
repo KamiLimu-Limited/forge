@@ -1,69 +1,81 @@
-"""Extra activity schemas: one typed payload per activity kind."""
+"""Extra activity and consultant schemas: one typed payload per log type."""
 
 import datetime as dt
 import enum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Self
 from uuid import UUID
 
-from pydantic import Field, TypeAdapter
+from pydantic import EmailStr, Field, model_validator
 
 from forge.models import ActivityStatus, ActivityType
+from forge.models.activity import (
+    ConsultationStatus,
+    EventRole,
+    FinalOutcome,
+    OpportunityStage,
+)
 from forge.schemas.common import PageParams, RequestSchema, Schema, Title
 
-
-class EventRole(enum.StrEnum):
-    ATTENDEE = "attendee"
-    SPEAKER = "speaker"
-    VOLUNTEER = "volunteer"
-    ORGANIZER = "organizer"
-    PANELIST = "panelist"
+LongText = Annotated[str, Field(min_length=1, max_length=5000)]
+OFFER_OUTCOMES = (FinalOutcome.OFFER_ACCEPTED, FinalOutcome.OFFER_REJECTED)
 
 
 class EventMode(enum.StrEnum):
-    PHYSICAL = "physical"
+    IN_PERSON = "in_person"
     VIRTUAL = "virtual"
-    HYBRID = "hybrid"
-
-
-class OpportunityOutcome(enum.StrEnum):
-    APPLIED = "applied"
-    SHORTLISTED = "shortlisted"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
 
 
 class AcademicDetails(RequestSchema):
-    course_name: str = Field(min_length=1, max_length=200)
-    related_session_ids: list[UUID] = []
-    kami_limu_pillar: str | None = Field(None, max_length=100)
+    kami_limu_pillar: str = Field(
+        min_length=1, max_length=100, description="The programme track it relates to"
+    )
+    related_session_ids: list[UUID] = Field(
+        min_length=1, description="Sessions whose lessons you applied"
+    )
+    how_applied: LongText
 
 
 class EventDetails(RequestSchema):
     event_role: EventRole
     mode: EventMode
-    organizer: str | None = Field(None, max_length=200)
-    learnings: str = Field(min_length=1, max_length=5000)
+    learnings: LongText = Field(
+        description="What you learned and how it relates to the programme"
+    )
 
 
-class OpportunityDetails(RequestSchema):
-    organization: str = Field(min_length=1, max_length=200)
-    application_date: dt.date
-    outcome_status: OpportunityOutcome = OpportunityOutcome.APPLIED
+class ApplicationDetails(RequestSchema):
+    """A job, scholarship or fellowship application."""
+
+    organisation: str = Field(min_length=1, max_length=200)
+    date_applied: dt.date
+    related_session_ids: list[UUID] = []
+    how_applied: LongText = Field(description="How you applied KamiLimu lessons")
+    stage: OpportunityStage = OpportunityStage.APPLIED
+    final_outcome: FinalOutcome = FinalOutcome.WAITING
+
+    @model_validator(mode="after")
+    def check_outcome(self) -> Self:
+        if self.final_outcome in OFFER_OUTCOMES and (
+            self.stage is not OpportunityStage.OFFER_MADE
+        ):
+            raise ValueError("An offer outcome needs stage `offer_made`")
+        return self
 
 
 class ConsultationDetails(RequestSchema):
-    mentor_id: UUID | None = Field(
-        None, description="Forge user id of the mentor, if they have an account"
+    consultation_type: str = Field(
+        min_length=1, max_length=100, examples=["Career guidance"]
     )
-    mentor_name: str | None = Field(None, max_length=200)
-    consultation_date: dt.date
-    outcome: str = Field(min_length=1, max_length=5000)
+    summary: LongText
+    support_received: str | None = Field(None, max_length=5000)
+    status: ConsultationStatus = ConsultationStatus.COMPLETED
 
 
 DETAILS_MODELS: dict[ActivityType, type[RequestSchema]] = {
     ActivityType.ACADEMIC: AcademicDetails,
     ActivityType.EVENT: EventDetails,
-    ActivityType.OPPORTUNITY: OpportunityDetails,
+    ActivityType.OPPORTUNITY: ApplicationDetails,
+    ActivityType.SCHOLARSHIP: ApplicationDetails,
     ActivityType.CONSULTATION: ConsultationDetails,
 }
 
@@ -72,7 +84,7 @@ class ActivityBase(RequestSchema):
     cohort_id: UUID | None = Field(
         None, description="Defaults to your most recent cohort"
     )
-    title: Title
+    title: Title = Field(description="Course, event, opportunity or consultation name")
     description: str | None = Field(None, max_length=5000)
     date: dt.date
 
@@ -86,10 +98,15 @@ class ExternalEventRequest(ActivityBase):
 
 
 class OpportunityApplicationRequest(ActivityBase):
-    details: OpportunityDetails
+    details: ApplicationDetails
+
+
+class ScholarshipApplicationRequest(ActivityBase):
+    details: ApplicationDetails
 
 
 class ConsultationSessionRequest(ActivityBase):
+    consultant_id: UUID = Field(description="A consultant from `/consultants`")
     details: ConsultationDetails
 
 
@@ -97,6 +114,7 @@ ActivityRequest = (
     AcademicActivityRequest
     | ExternalEventRequest
     | OpportunityApplicationRequest
+    | ScholarshipApplicationRequest
     | ConsultationSessionRequest
 )
 
@@ -105,20 +123,16 @@ class ActivityUpdateRequest(RequestSchema):
     title: Title | None = None
     description: str | None = Field(None, max_length=5000)
     date: dt.date | None = None
+    consultant_id: UUID | None = None
     details: dict[str, Any] | None = Field(
         None,
-        description="Partial details; merged and re-validated for the activity's type",
+        description="Partial details, e.g. a new `stage` or `final_outcome`; merged "
+        "and re-validated for the activity's type",
     )
 
 
-class ActivityReviewRequest(RequestSchema):
-    points_awarded: int | None = Field(
-        None,
-        ge=0,
-        le=1000,
-        description="Approval only; defaults to the configured points for the type",
-    )
-    reason: str | None = Field(None, max_length=2000)
+class ActivityReversalRequest(RequestSchema):
+    reason: str = Field(min_length=3, max_length=2000)
 
 
 class ActivityFilters(PageParams):
@@ -128,8 +142,9 @@ class ActivityFilters(PageParams):
     mentee_id: UUID | None = None
 
 
-class _ActivityResponse(Schema):
+class ExtraActivityResponse(Schema):
     id: UUID
+    type: ActivityType
     mentee_id: UUID
     cohort_id: UUID
     title: str
@@ -137,40 +152,47 @@ class _ActivityResponse(Schema):
     date: dt.date
     status: ActivityStatus
     points_awarded: int
-    reviewed_by: UUID | None
-    reviewed_at: dt.datetime | None
-    review_reason: str | None
+    consultant_id: UUID | None
+    details: dict[str, Any] = Field(
+        description="The type-specific fields submitted for this log"
+    )
+    reversed_by: UUID | None
+    reversed_at: dt.datetime | None
+    reversal_reason: str | None
     created_at: dt.datetime
     updated_at: dt.datetime
 
 
-class AcademicActivityResponse(_ActivityResponse):
-    type: Literal[ActivityType.ACADEMIC]
-    details: AcademicDetails
+class TypeProgress(Schema):
+    type: ActivityType
+    logged: int
+    target: int
+    points: int
 
 
-class ExternalEventResponse(_ActivityResponse):
-    type: Literal[ActivityType.EVENT]
-    details: EventDetails
+class ActivityProgressResponse(Schema):
+    cohort_id: UUID
+    types: list[TypeProgress]
 
 
-class OpportunityApplicationResponse(_ActivityResponse):
-    type: Literal[ActivityType.OPPORTUNITY]
-    details: OpportunityDetails
+class ConsultantRequest(RequestSchema):
+    name: str = Field(min_length=1, max_length=200)
+    email: EmailStr | None = None
+    organisation: str | None = Field(None, max_length=200)
+    expertise: str | None = Field(None, max_length=2000)
 
 
-class ConsultationSessionResponse(_ActivityResponse):
-    type: Literal[ActivityType.CONSULTATION]
-    details: ConsultationDetails
+class ConsultantUpdateRequest(RequestSchema):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    email: EmailStr | None = None
+    organisation: str | None = Field(None, max_length=200)
+    expertise: str | None = Field(None, max_length=2000)
 
 
-ExtraActivityResponse = Annotated[
-    AcademicActivityResponse
-    | ExternalEventResponse
-    | OpportunityApplicationResponse
-    | ConsultationSessionResponse,
-    Field(discriminator="type"),
-]
-activity_adapter: TypeAdapter[ExtraActivityResponse] = TypeAdapter(
-    ExtraActivityResponse
-)
+class ConsultantResponse(Schema):
+    id: UUID
+    name: str
+    email: str | None
+    organisation: str | None
+    expertise: str | None
+    is_active: bool

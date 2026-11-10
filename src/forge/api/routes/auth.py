@@ -11,6 +11,7 @@ from forge.api.deps import (
     ClientIP,
     CurrentUser,
     DbSession,
+    ProgramLeadUser,
     RateLimited,
 )
 from forge.models import Invitation
@@ -30,6 +31,7 @@ from forge.schemas.auth import (
     UserInviteRequest,
 )
 from forge.schemas.common import SuccessResponse
+from forge.schemas.graduation import ConfirmationResponse, ConfirmPasswordRequest
 from forge.services import auth as auth_service
 from forge.services.email import send_invitation_email, send_password_reset_email
 
@@ -83,10 +85,13 @@ async def bulk_invite_users(
     admin: AdminUser,
     db: DbSession,
 ) -> BulkInviteResponse:
-    """Invite many users at once (e.g. a whole cohort). **Admin only.**
+    """Invite many users at once (e.g. a whole cohort) with their profile fields.
+    **Admin only.**
 
-    Each user is processed independently; the response reports success or the
-    failure reason per email.
+    ICT tracks and peer mentors are not part of the import: mentees choose their
+    track during track selection and peer mentors are assigned later. Each user is
+    processed independently; the response reports success or the failure reason
+    per email.
     """
     results, invitations = await auth_service.bulk_create_invitations(
         db, data.users, data.cohort_id, admin
@@ -99,7 +104,10 @@ async def bulk_invite_users(
 async def bulk_invite_csv(
     file: Annotated[
         UploadFile,
-        File(description="CSV with columns email,first_name,last_name,roles"),
+        File(
+            description="CSV with columns email,first_name,last_name,roles and "
+            "optional profile columns"
+        ),
     ],
     background_tasks: BackgroundTasks,
     admin: AdminUser,
@@ -108,8 +116,11 @@ async def bulk_invite_csv(
 ) -> BulkInviteResponse:
     """Invite users from a CSV upload. **Admin only.**
 
-    Columns: `email,first_name,last_name,roles`. Separate multiple roles with `;`,
-    e.g. `peer_mentor_1:1;alumni`. Invalid rows are reported and skipped.
+    Required columns: `email,first_name,last_name,roles`. Separate multiple roles
+    with `;`, e.g. `peer_mentor_1_1;alumni`. Optional profile columns: `university,
+    programme_of_study, degree_level, gender, phone, birthday, linkedin, github,
+    instagram, twitter, website`. ICT track and peer mentor columns are rejected:
+    both are assigned later. Invalid rows are reported and skipped.
     """
     entries, row_errors = auth_service.parse_invite_csv(await file.read())
     results, invitations = await auth_service.bulk_create_invitations(
@@ -140,7 +151,8 @@ async def activate_account(
 
 @router.post("/login", dependencies=[RateLimited])
 async def login(data: LoginRequest, db: DbSession, ip: ClientIP) -> TokenResponse:
-    """Exchange email and password for an access token (1h) and refresh token (7d).
+    """Exchange email and password for an access token (1h) and a refresh token
+    whose lifetime is set by `REFRESH_TOKEN_EXPIRE_DAYS` (30 to 90 days).
 
     Send the access token as `Authorization: Bearer <access_token>`.
     """
@@ -150,7 +162,8 @@ async def login(data: LoginRequest, db: DbSession, ip: ClientIP) -> TokenRespons
 
 @router.post("/refresh")
 async def refresh_token(data: TokenRefreshRequest, db: DbSession) -> TokenResponse:
-    """Rotate tokens: the submitted refresh token is revoked and a new pair issued."""
+    """Rotate tokens: the submitted refresh token is revoked and a new pair issued,
+    with the configured refresh lifetime (30 to 90 days)."""
     return await auth_service.refresh_tokens(db, data.refresh_token)
 
 
@@ -197,3 +210,14 @@ async def complete_password_reset(
     """Set a new password using the token from the reset email."""
     await auth_service.reset_password(db, data.token, data.new_password)
     return SuccessResponse(message="Password has been reset successfully")
+
+
+@router.post("/confirm-password", dependencies=[RateLimited])
+async def confirm_password(
+    data: ConfirmPasswordRequest, user: ProgramLeadUser
+) -> ConfirmationResponse:
+    """Re-check your password before a sensitive action such as graduating a
+    cohort. Send the returned token as `X-Confirmation-Token`; it expires after
+    `CONFIRMATION_TOKEN_EXPIRE_MINUTES`. **Program Lead.**"""
+    token, expires_at = auth_service.confirm_password(user, data.password)
+    return ConfirmationResponse(confirmation_token=token, expires_at=expires_at)

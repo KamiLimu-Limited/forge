@@ -7,15 +7,14 @@ from fastapi import APIRouter, Depends, Query, status
 
 from forge.api.deps import (
     ActiveUser,
-    AdminUser,
-    CommitteeUser,
     DbSession,
-    MenteeUser,
+    ManagerUser,
+    ParticipantUser,
     PeerMentorUser,
 )
 from forge.api.routes.cohorts import MemberCohort
 from forge.api.routes.sessions import VisibleSession
-from forge.models import AttendanceRecord, AttendanceWindow, OverrideRequest, User
+from forge.models import AttendanceRecord, AttendanceWindow, OverrideRequest
 from forge.schemas.attendance import (
     AttendanceFilters,
     AttendanceResponse,
@@ -23,7 +22,6 @@ from forge.schemas.attendance import (
     AttendanceSubmissionRequest,
     AttendanceUpdateRequest,
     AttendanceWindowResponse,
-    MyAttendanceResponse,
     OverrideFilters,
     OverrideRequestCreate,
     OverrideRequestResponse,
@@ -53,39 +51,35 @@ async def override_request(request_id: UUID, db: DbSession) -> OverrideRequest:
 TargetOverrideRequest = Annotated[OverrideRequest, Depends(override_request)]
 
 
-def present(record: AttendanceRecord, viewer: User) -> AttendanceResponse:
-    """Personal notes are only ever shown to the mentee who wrote them."""
-    schema = (
-        MyAttendanceResponse if record.mentee_id == viewer.id else AttendanceResponse
-    )
-    return schema.model_validate(record)
-
-
 @router.post(
     "/attendance",
     status_code=status.HTTP_201_CREATED,
-    response_model=MyAttendanceResponse,
+    response_model=AttendanceResponse,
 )
 async def submit_attendance(
-    data: AttendanceSubmissionRequest, mentee: MenteeUser, db: DbSession
+    data: AttendanceSubmissionRequest, user: ParticipantUser, db: DbSession
 ) -> AttendanceRecord:
-    """Record your attendance and feedback for a session. **Mentees only.**
+    """Record your attendance and feedback for a session. **Mentees and peer
+    mentors.**
 
     Allowed only while the session's attendance window (or your approved
-    override) is open. Ratings (1–5) apply only when `status` is `attended`.
+    extension) is open. `present` needs all nine ratings (1-5, in question order)
+    and feedback; `absent` takes no ratings. `source` records whether it was
+    submitted `on_time` or in a `reopened` window.
     """
-    return await attendance_service.submit_attendance(db, mentee, data)
+    return await attendance_service.submit_attendance(db, user, data)
 
 
 @router.get("/attendance/me")
 async def my_attendance(
     filters: Annotated[AttendanceFilters, Query()], user: ActiveUser, db: DbSession
-) -> Page[MyAttendanceResponse]:
-    """Your attendance records, filterable by cohort, month, track and status."""
+) -> Page[AttendanceResponse]:
+    """Your attendance records, filterable by cohort, KamiLimu month
+    (`kami_limu_month`), track and status."""
     records, total = await attendance_service.list_records(
         db, filters, mentee_ids=[user.id]
     )
-    return Page[MyAttendanceResponse].build(records, total, filters)
+    return Page[AttendanceResponse].build(records, total, filters)
 
 
 @router.post(
@@ -94,17 +88,18 @@ async def my_attendance(
     response_model=OverrideRequestResponse,
 )
 async def request_override(
-    data: OverrideRequestCreate, mentee: MenteeUser, db: DbSession
+    data: OverrideRequestCreate, user: ParticipantUser, db: DbSession
 ) -> OverrideRequest:
-    """Ask the committee to reopen a closed attendance window for you."""
-    return await attendance_service.create_override_request(db, mentee, data)
+    """Ask a System Admin to reopen a closed attendance window for you, optionally
+    with the new deadline you need."""
+    return await attendance_service.create_override_request(db, user, data)
 
 
 @router.get("/attendance/override-requests")
 async def list_override_requests(
     filters: Annotated[OverrideFilters, Query()], user: ActiveUser, db: DbSession
 ) -> Page[OverrideRequestResponse]:
-    """Mentees see their own requests; committee members see their cohorts'."""
+    """Participants see their own requests; staff see their cohorts'."""
     requests, total = await attendance_service.list_override_requests(db, user, filters)
     return Page[OverrideRequestResponse].build(requests, total, filters)
 
@@ -116,11 +111,12 @@ async def list_override_requests(
 async def approve_override_request(
     request: TargetOverrideRequest,
     data: OverrideReviewRequest,
-    reviewer: CommitteeUser,
+    reviewer: ManagerUser,
     db: DbSession,
 ) -> OverrideRequest:
-    """Approve and extend the mentee's window to `new_closes_at`
-    (default: now + `OVERRIDE_EXTENSION_HOURS`). **Committee.**"""
+    """Approve and extend the participant's window to `new_closes_at`, defaulting
+    to the deadline they asked for, else now + `OVERRIDE_EXTENSION_HOURS`.
+    **System Admin or Program Lead.**"""
     return await attendance_service.review_override_request(
         db, reviewer, request, data, approve=True
     )
@@ -133,31 +129,31 @@ async def approve_override_request(
 async def deny_override_request(
     request: TargetOverrideRequest,
     data: OverrideReviewRequest,
-    reviewer: CommitteeUser,
+    reviewer: ManagerUser,
     db: DbSession,
 ) -> OverrideRequest:
-    """Deny an override request, optionally with a reason. **Committee.**"""
+    """Deny an override request, optionally with a reason. **System Admin or
+    Program Lead.**"""
     return await attendance_service.review_override_request(
         db, reviewer, request, data, approve=False
     )
 
 
-@router.get(
-    "/attendance/{record_id}", response_model=MyAttendanceResponse | AttendanceResponse
-)
-async def get_attendance(record: VisibleRecord, user: ActiveUser) -> AttendanceResponse:
-    """A single attendance record. Personal notes are included only for its mentee."""
-    return present(record, user)
+@router.get("/attendance/{record_id}", response_model=AttendanceResponse)
+async def get_attendance(record: VisibleRecord) -> AttendanceRecord:
+    """A single attendance record."""
+    return record
 
 
-@router.patch("/attendance/{record_id}", response_model=MyAttendanceResponse)
+@router.patch("/attendance/{record_id}", response_model=AttendanceResponse)
 async def update_attendance(
     data: AttendanceUpdateRequest,
     record: VisibleRecord,
     user: ActiveUser,
     db: DbSession,
 ) -> AttendanceRecord:
-    """Edit your submission while the window is still open."""
+    """Edit your submission while the window is still open. The same rules as
+    submitting apply to the result."""
     return await attendance_service.update_attendance(db, user, record, data)
 
 
@@ -165,11 +161,12 @@ async def update_attendance(
 async def set_attendance_status(
     data: AttendanceStatusUpdateRequest,
     record: VisibleRecord,
-    staff: CommitteeUser,
+    staff: ManagerUser,
     db: DbSession,
 ) -> AttendanceRecord:
-    """Set a record's status (e.g. `excused`, `disputed`). **Committee.**
-    Excused sessions are left out of the mentee's attendance rate."""
+    """Set a record's status: `pending`, `present`, `absent`, `missed` or
+    `excused`. **System Admin or Program Lead.** Excused sessions are left out of
+    the attendance rate."""
     return await attendance_service.set_record_status(db, staff, record, data)
 
 
@@ -185,9 +182,10 @@ async def get_attendance_window(
     "/attendance-windows/{window_id}/close", response_model=AttendanceWindowResponse
 )
 async def close_attendance_window(
-    window_id: UUID, admin: AdminUser, db: DbSession
+    window_id: UUID, admin: ManagerUser, db: DbSession
 ) -> AttendanceWindow:
-    """Close a window early. **Admin only.** Approved overrides still apply."""
+    """Close a window early. **System Admin or Program Lead.** Approved
+    extensions still apply."""
     return await attendance_service.close_window(db, admin, window_id)
 
 
@@ -198,7 +196,7 @@ async def cohort_attendance(
     user: ActiveUser,
     db: DbSession,
 ) -> Page[AttendanceResponse]:
-    """Every attendance record in a cohort. **Committee of the cohort.**"""
+    """Every attendance record in a cohort. **Staff of the cohort.**"""
     ensure_cohort_staff(user, cohort.id)
     filters = filters.model_copy(update={"cohort_id": cohort.id})
     records, total = await attendance_service.list_records(db, filters)
